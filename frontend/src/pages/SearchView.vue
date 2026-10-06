@@ -8,24 +8,45 @@ import { useCatalogFilter } from '@/hooks/useCatalogFilter'
 import { useCoverStore } from '@/stores/coverStore'
 import { usePostmarkStore } from '@/stores/postmarkStore'
 import { useRouteStore } from '@/stores/routeStore'
+import { useConflictStore } from '@/stores/conflictStore'
 import type { Cover } from '@/types/cover'
 import type { Postmark } from '@/types/postmark'
 import type { PostalRoute } from '@/types/route'
 import { POSTMARK_TYPES } from '@/types/postmark'
 import { TRANSPORT_MODES } from '@/types/route'
 import { parseEraRange, toGanzhi } from '@/utils/dateRange'
+import { coverTimelineStartYear, isTimelineStale } from '@/utils/timelineStatus'
 
 const router = useRouter()
 const postmarkStore = usePostmarkStore()
 const coverStore = useCoverStore()
 const routeStore = useRouteStore()
+const conflictStore = useConflictStore()
 
 const keyword = ref('')
 const era = ref('')
 const groups = reactive({ postmark: true, cover: true, route: true })
 
+/** 封是否暂停命中：时间轴失效（节点改动后基线未跟进）或挂接待裁定。 */
+function coverSuspended(row: unknown): boolean {
+  const cover = row as Cover
+  const route =
+    typeof cover.routeId === 'number' ? routeStore.byId(cover.routeId) : null
+  return isTimelineStale(cover, route, conflictStore.openConflictOfCover(cover.id ?? -1) != null)
+}
+
+/** 封的检索代表年份：与详情页时间轴同源，避免两套年代结果。 */
+function coverYear(row: unknown): number {
+  const cover = row as Cover
+  const route = typeof cover.routeId === 'number' ? routeStore.byId(cover.routeId) : null
+  return coverTimelineStartYear(cover, route).year
+}
+
 const pmFilter = useCatalogFilter<Postmark>('postmark', computed(() => postmarkStore.list))
-const coverFilter = useCatalogFilter<Cover>('cover', computed(() => coverStore.list))
+const coverFilter = useCatalogFilter<Cover>('cover', computed(() => coverStore.list), {
+  isSuspended: coverSuspended,
+  yearOfRow: coverYear
+})
 const routeFilter = useCatalogFilter<PostalRoute>('route', computed(() => routeStore.list))
 
 const eraHint = computed(() => {
@@ -38,6 +59,7 @@ onMounted(async () => {
   if (!postmarkStore.loaded) await postmarkStore.load()
   if (!coverStore.loaded) await coverStore.load()
   if (!routeStore.loaded) await routeStore.load()
+  if (!conflictStore.loaded) await conflictStore.load()
 })
 
 watch([keyword, era], () => {
@@ -50,6 +72,9 @@ watch([keyword, era], () => {
 const totalHits = computed(
   () => pmFilter.filtered.value.length + coverFilter.filtered.value.length + routeFilter.filtered.value.length
 )
+
+/** 被暂停命中的实寄封（时间轴失效 / 挂接待裁定），单独计数提示。 */
+const pausedCovers = computed(() => coverFilter.suspendedRows.value)
 
 const detailDialog = ref(false)
 const activePostmark = ref<Postmark | null>(null)
@@ -164,6 +189,10 @@ function resetAll(): void {
           </el-form-item>
         </el-form>
       </div>
+      <p v-if="pausedCovers.length" class="search-view__paused">
+        命中暂停：{{ pausedCovers.length }} 封的寄递时间轴已失效（邮路节点已改未核对）或挂接待裁定，
+        暂不参与检索；请到封详情核对补基线，或到邮路页完成裁定后恢复。
+      </p>
       <p v-if="!coverFilter.filtered.value.length" class="gb-empty">没有匹配的实寄封。</p>
       <div v-else class="gb-grid gb-grid--wide">
         <CoverCard
@@ -247,6 +276,15 @@ function resetAll(): void {
   margin: 6px 0 0;
   font-size: 12px;
   color: var(--gb-muted);
+}
+.search-view__paused {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: #b06f16;
+  background: #fdf5e6;
+  border: 1px solid #ecd3a5;
+  border-radius: 8px;
+  padding: 8px 12px;
 }
 .search-view__pm img {
   max-width: 100%;

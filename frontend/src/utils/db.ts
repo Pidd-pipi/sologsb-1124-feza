@@ -8,10 +8,11 @@ import type { Cover } from '@/types/cover'
 import type { PostalRoute } from '@/types/route'
 import type { StamplessEntry } from '@/types/stampentry'
 import type { AssetOwnerType, AssetSide, CatalogAsset } from '@/types/asset'
+import type { MergeConflict } from '@/types/conflict'
 
 export const DB_NAME = 'gbpostmark'
 /** 当前数据结构版本号，升级迁移写在下面对应的 version() 中 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export class GbPostmarkDatabase extends Dexie {
   postmarks!: Table<Postmark, number>
@@ -20,6 +21,8 @@ export class GbPostmarkDatabase extends Dexie {
   stampEntries!: Table<StamplessEntry, number>
   /** 戳样 / 封图原图，单独建表 */
   assets!: Table<CatalogAsset, number>
+  /** 修订基线合并时的待裁定记录 */
+  mergeConflicts!: Table<MergeConflict, number>
 
   constructor() {
     super(DB_NAME)
@@ -71,6 +74,56 @@ export class GbPostmarkDatabase extends Dexie {
           .modify((rt: Partial<PostalRoute>) => {
             if (!Array.isArray(rt.nodes)) rt.nodes = []
             if (typeof rt.totalDays !== 'number') rt.totalDays = 0
+          })
+      })
+
+    // v3：修订基线合并。四类记录补 rev；邮路补 nodesRev、封补 timelineBaseRev；
+    // 新增 mergeConflicts 表存放待裁定挂接。旧数据按「节点与封当前是一致的」补基线，
+    // 即已挂接的封沿用所属邮路当前 nodesRev，升级后不会被误判为时间轴失效。
+    this.version(DB_VERSION)
+      .stores({
+        postmarks:
+          '++id, pmNo, type, office, province, yearFrom, yearTo, scarceLevel, inkColor, bilingual, rev',
+        covers:
+          '++id, coverNo, sentFrom, sentTo, postDate, conditionGrade, registered, routeId, acquireFrom, rev, timelineBaseRev',
+        routes: '++id, routeNo, name, era, transport, totalDays, rev, nodesRev',
+        stampEntries: '++id, coverId, stampName, variety, issueYear, rev',
+        assets: '++id, ownerType, ownerId, side, [ownerType+ownerId]',
+        mergeConflicts:
+          '++id, kind, coverId, createdAt, resolvedAt, [kind+resolvedAt], [coverId+resolvedAt]'
+      })
+      .upgrade(async (tx) => {
+        // 先取各邮路当前 nodesRev（旧数据没有，统一补 1）
+        const routeNodesRev = new Map<number, number>()
+        await tx
+          .table('routes')
+          .toCollection()
+          .modify((rt: Partial<PostalRoute>) => {
+            if (typeof rt.rev !== 'number') rt.rev = 1
+            if (typeof rt.nodesRev !== 'number') rt.nodesRev = 1
+            if (typeof rt.id === 'number') routeNodesRev.set(rt.id, rt.nodesRev)
+          })
+        await tx
+          .table('postmarks')
+          .toCollection()
+          .modify((pm: Partial<Postmark>) => {
+            if (typeof pm.rev !== 'number') pm.rev = 1
+          })
+        await tx
+          .table('covers')
+          .toCollection()
+          .modify((cv: Partial<Cover>) => {
+            if (typeof cv.rev !== 'number') cv.rev = 1
+            // 已挂接的封：基线对齐所属邮路当前 nodesRev（当前时间轴视为仍有效）；
+            // 未挂接的封：无节点可失效，基线给 1 即可。
+            const base = typeof cv.routeId === 'number' ? routeNodesRev.get(cv.routeId) : undefined
+            cv.timelineBaseRev = base ?? 1
+          })
+        await tx
+          .table('stampEntries')
+          .toCollection()
+          .modify((se: Partial<StamplessEntry>) => {
+            if (typeof se.rev !== 'number') se.rev = 1
           })
       })
   }
@@ -177,7 +230,10 @@ function coverThumbDataUrl(coverNo: string, from: string, to: string, date: stri
 const SEED_TS = '2024-05-01T09:00:00.000Z'
 
 function seedPostmarks(): Postmark[] {
-  const base = (pm: Postmark): Postmark => ({ ...pm, imageDataUrl: postmarkSampleDataUrl(pm) })
+  const base = (pm: Postmark): Postmark => ({
+    ...pm,
+    imageDataUrl: postmarkSampleDataUrl(pm)
+  })
   return [
     base({
       id: 1,
@@ -194,6 +250,7 @@ function seedPostmarks(): Postmark[] {
       bilingual: true,
       scarceLevel: '少见',
       imageDataUrl: '',
+      rev: 1,
       note: '三格圆形日戳，中英文并用，戳面清晰，边线完整。',
       createdAt: SEED_TS,
       updatedAt: SEED_TS
@@ -213,6 +270,7 @@ function seedPostmarks(): Postmark[] {
       bilingual: true,
       scarceLevel: '罕见',
       imageDataUrl: '',
+      rev: 1,
       note: '滚筒戳戳面横长，销票时墨色偏淡，此枚墨色饱满。',
       createdAt: SEED_TS,
       updatedAt: SEED_TS
@@ -232,6 +290,7 @@ function seedPostmarks(): Postmark[] {
       bilingual: true,
       scarceLevel: '常见',
       imageDataUrl: '',
+      rev: 1,
       note: '机盖波纹戳，波纹段共六线，用于快速销票。',
       createdAt: SEED_TS,
       updatedAt: SEED_TS
@@ -251,6 +310,7 @@ function seedPostmarks(): Postmark[] {
       bilingual: false,
       scarceLevel: '少见',
       imageDataUrl: '',
+      rev: 1,
       note: '纪念戳仅在纪念日启用，戳径大于同期日戳。',
       createdAt: SEED_TS,
       updatedAt: SEED_TS
@@ -270,6 +330,7 @@ function seedPostmarks(): Postmark[] {
       bilingual: false,
       scarceLevel: '常见',
       imageDataUrl: '',
+      rev: 1,
       note: '风景戳以西湖三潭印月为主图，供集邮者加盖。',
       createdAt: SEED_TS,
       updatedAt: SEED_TS
@@ -289,6 +350,7 @@ function seedPostmarks(): Postmark[] {
       bilingual: false,
       scarceLevel: '孤品',
       imageDataUrl: '',
+      rev: 1,
       note: '军邮局编号戳，抗战时期随军邮站流转，存世极少。',
       createdAt: SEED_TS,
       updatedAt: SEED_TS
@@ -311,6 +373,8 @@ function seedRoutes(): PostalRoute[] {
         { key: 'rt1-n4', office: '南京', arriveDate: '1910-06-21', transitMark: '南京到达戳' }
       ],
       totalDays: 3,
+      rev: 1,
+      nodesRev: 1,
       frequency: '逐日班',
       remark: '沪宁铁路通车后邮件改由火车运送，全程三日可达。',
       createdAt: SEED_TS,
@@ -330,6 +394,8 @@ function seedRoutes(): PostalRoute[] {
         { key: 'rt2-n5', office: '上海', arriveDate: '1921-03-10', transitMark: '上海到达戳' }
       ],
       totalDays: 5,
+      rev: 1,
+      nodesRev: 1,
       frequency: '隔日班',
       remark: '津浦线与沪宁线联运，邮件按班期在徐州接驳。',
       createdAt: SEED_TS,
@@ -348,12 +414,14 @@ function seedRoutes(): PostalRoute[] {
         { key: 'rt3-n4', office: '武汉', arriveDate: '1936-09-20', transitMark: '武汉到达戳' }
       ],
       totalDays: 8,
+      rev: 1,
+      nodesRev: 1,
       frequency: '旬日班',
       remark: '长江轮船带运邮件，受水位影响班期常有延误。',
       createdAt: SEED_TS,
       updatedAt: SEED_TS
     }
-  ]
+  ] as PostalRoute[]
 }
 
 function seedCovers(): Cover[] {
@@ -380,6 +448,8 @@ function seedCovers(): Cover[] {
       frontImage: coverThumbDataUrl('CV-0001', '上海', '南京', '1910-06-18'),
       backImage: '',
       note: '挂号实寄，封背有三处中转戳，戳面完整。',
+      rev: 1,
+      timelineBaseRev: 1,
       createdAt: SEED_TS,
       updatedAt: SEED_TS
     },
@@ -402,6 +472,8 @@ function seedCovers(): Cover[] {
       frontImage: coverThumbDataUrl('CV-0002', '天津', '上海', '1921-03-05'),
       backImage: '',
       note: '平信，封舌有裂口，票戳关系清晰。',
+      rev: 1,
+      timelineBaseRev: 1,
       createdAt: SEED_TS,
       updatedAt: SEED_TS
     },
@@ -427,6 +499,8 @@ function seedCovers(): Cover[] {
       frontImage: coverThumbDataUrl('CV-0003', '广州', '武汉', '1936-09-12'),
       backImage: '',
       note: '封体有水渍，邮路节点仍可辨读。',
+      rev: 1,
+      timelineBaseRev: 1,
       createdAt: SEED_TS,
       updatedAt: SEED_TS
     },
@@ -449,6 +523,8 @@ function seedCovers(): Cover[] {
       frontImage: coverThumbDataUrl('CV-0004', '南京', '杭州', '1958-04-02'),
       backImage: '',
       note: '到达日期待考，暂按邮路班期推定。',
+      rev: 1,
+      timelineBaseRev: 1,
       createdAt: SEED_TS,
       updatedAt: SEED_TS
     }
@@ -466,6 +542,7 @@ function seedStampEntries(): StamplessEntry[] {
       perforation: 'P14',
       variety: '正品',
       positionOnCover: '右上',
+      rev: 1,
       createdAt: SEED_TS
     },
     {
@@ -477,6 +554,7 @@ function seedStampEntries(): StamplessEntry[] {
       perforation: 'P14',
       variety: '移位',
       positionOnCover: '中部',
+      rev: 1,
       createdAt: SEED_TS
     },
     {
@@ -488,6 +566,7 @@ function seedStampEntries(): StamplessEntry[] {
       perforation: 'P14',
       variety: '正品',
       positionOnCover: '右上',
+      rev: 1,
       createdAt: SEED_TS
     },
     {
@@ -499,6 +578,7 @@ function seedStampEntries(): StamplessEntry[] {
       perforation: 'P12.5',
       variety: '组外品',
       positionOnCover: '左上',
+      rev: 1,
       createdAt: SEED_TS
     },
     {
@@ -510,6 +590,7 @@ function seedStampEntries(): StamplessEntry[] {
       perforation: 'P12.5',
       variety: '漏齿',
       positionOnCover: '左下',
+      rev: 1,
       createdAt: SEED_TS
     },
     {
@@ -521,6 +602,7 @@ function seedStampEntries(): StamplessEntry[] {
       perforation: 'P14',
       variety: '正品',
       positionOnCover: '右上',
+      rev: 1,
       createdAt: SEED_TS
     }
   ]

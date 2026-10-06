@@ -24,6 +24,9 @@ export interface TimelineNode {
   kind: 'sent' | 'transit' | 'arrive'
 }
 
+/** 初始修订基线：新建记录一律从 1 开始。 */
+export const INITIAL_REV = 1
+
 export interface PostalRoute {
   id?: number
   /** 邮路号，如 RT-0001 */
@@ -38,6 +41,10 @@ export interface PostalRoute {
   /** 班期，如「逐日班」「隔日班」 */
   frequency: string
   remark: string
+  /** 记录修订号（任一字段更新即自增），多标签页合并的基线 */
+  rev: number
+  /** 节点修订号：只有节点增删/改日期/排序才自增；挂接封的 timelineBaseRev 与之比对 */
+  nodesRev: number
   createdAt: string
   updatedAt: string
 }
@@ -55,6 +62,8 @@ export function createEmptyRoute(): PostalRoute {
     totalDays: 0,
     frequency: '',
     remark: '',
+    rev: 0,
+    nodesRev: 0,
     createdAt: '',
     updatedAt: ''
   }

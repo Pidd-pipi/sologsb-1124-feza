@@ -10,6 +10,7 @@ import { useCoverRoute } from '@/hooks/useCoverRoute'
 import { useCoverStore } from '@/stores/coverStore'
 import { usePostmarkStore } from '@/stores/postmarkStore'
 import { useRouteStore } from '@/stores/routeStore'
+import { useConflictStore } from '@/stores/conflictStore'
 import type { Postmark } from '@/types/postmark'
 import type { TimelineNode } from '@/types/route'
 import type { StamplessEntry } from '@/types/stampentry'
@@ -21,20 +22,33 @@ import {
 import { CONDITION_GRADES } from '@/types/cover'
 import { loadAssets, saveAsset } from '@/utils/db'
 import { nowIso } from '@/utils/id'
+import { saveRecoverableDraft } from '@/utils/draft'
 
 const props = defineProps<{ id: string }>()
 const router = useRouter()
 const coverStore = useCoverStore()
 const postmarkStore = usePostmarkStore()
 const routeStore = useRouteStore()
+const conflictStore = useConflictStore()
 
 const coverId = computed<number | null>(() => {
   const n = Number(props.id)
   return Number.isFinite(n) && n > 0 ? n : null
 })
 
-const { cover, route, timeline, transitDays, missingDateNodes, chronological, error, load } =
-  useCoverRoute(coverId)
+const {
+  cover,
+  route,
+  timeline,
+  transitDays,
+  missingDateNodes,
+  chronological,
+  stale,
+  pendingConflict,
+  revalidate,
+  error,
+  load
+} = useCoverRoute(coverId)
 
 const frontUrl = ref('')
 const backUrl = ref('')
@@ -51,6 +65,7 @@ onMounted(async () => {
   if (!coverStore.loaded) await coverStore.load()
   if (!postmarkStore.loaded) await postmarkStore.load()
   if (!routeStore.loaded) await routeStore.load()
+  if (!conflictStore.loaded) await conflictStore.load()
   await loadAssetsForCover()
 })
 
@@ -96,7 +111,18 @@ async function replaceImage(side: 'front' | 'back', file: UploadFile): Promise<v
     fileName: raw.name,
     updatedAt: nowIso()
   })
-  await coverStore.update(id, side === 'front' ? { frontImage: dataUrl } : { backImage: dataUrl })
+  try {
+    await coverStore.save(id, side === 'front' ? { frontImage: dataUrl } : { backImage: dataUrl })
+  } catch (err) {
+    saveRecoverableDraft(`cover-image:${id}:${side}`, {
+      reason: err instanceof Error ? err.message : String(err),
+      targetId: id,
+      baseRev: cover.value?.rev ?? null,
+      value: { side, fileName: raw.name }
+    })
+    ElMessage.error('图片信息保存失败，已回滚并留下可恢复草稿')
+    return
+  }
   await loadAssetsForCover()
   ElMessage.success(side === 'front' ? '已更新正面图' : '已更新背面图')
 }
@@ -112,9 +138,19 @@ function onBackChange(file: UploadFile): void {
 async function setGrade(grade: string): Promise<void> {
   const id = coverId.value
   if (id == null) return
-  await coverStore.update(id, { conditionGrade: grade as '上品' | '中品' | '下品' })
-  await load()
-  ElMessage.success(`品相已标记为${grade}`)
+  try {
+    const { conflictFields } = await coverStore.save(id, {
+      conditionGrade: grade as '上品' | '中品' | '下品'
+    })
+    await load()
+    if (conflictFields.length) {
+      ElMessage.warning('品相在另一页面已被改为不同值，已保留先保存的标记')
+    } else {
+      ElMessage.success(`品相已标记为${grade}`)
+    }
+  } catch (err) {
+    ElMessage.error(`品相保存失败，已回滚：${err instanceof Error ? err.message : String(err)}`)
+  }
 }
 
 function openEntryDialog(): void {
@@ -134,6 +170,17 @@ async function submitEntry(): Promise<void> {
   await coverStore.addEntry({ ...entryForm, coverId: id })
   entryDialog.value = false
   ElMessage.success('已加入票戳组合')
+}
+
+async function onRevalidate(): Promise<void> {
+  const ok = await revalidate()
+  if (ok) ElMessage.success('已按当前邮路节点核对并补基线，时间轴恢复有效、检索恢复命中')
+}
+
+function pendingRouteLabel(routeId: number | null): string {
+  if (routeId == null) return '摘除邮路'
+  const rt = routeStore.byId(routeId)
+  return rt ? `${rt.routeNo} ${rt.name}` : `邮路 #${routeId}`
 }
 
 async function removeEntry(entry: StamplessEntry): Promise<void> {
@@ -284,13 +331,29 @@ function openRoute(): void {
 
       <section class="gb-panel">
         <h2 class="gb-panel__title">寄递事实时间轴</h2>
-        <p v-if="!chronological" class="cover-detail__warn">
+        <div v-if="pendingConflict" class="cover-detail__stale">
+          <strong>挂接待裁定：</strong>
+          本封在另一页面被先挂到「{{ pendingRouteLabel(pendingConflict.winner.routeId) }}」，
+          后保存主张改挂「{{ pendingRouteLabel(pendingConflict.pending.routeId) }}」。
+          时间轴与检索命中暂停，请到邮路页裁决后恢复。
+          <el-button size="small" type="primary" plain @click="openRoute">前往邮路页裁定</el-button>
+        </div>
+        <div v-else-if="stale" class="cover-detail__stale">
+          <strong>时间轴已失效：</strong>
+          所属邮路「{{ route?.name ?? '' }}」的节点已改动（节点修订 {{ route?.nodesRev }}，
+          本封基线 {{ cover?.timelineBaseRev }}）。下方为旧时间轴，请核对后补基线，
+          综合检索在此期间暂停本封命中。
+          <el-button size="small" type="warning" @click="onRevalidate">核对无误，补基线</el-button>
+        </div>
+        <p v-if="!stale && !chronological" class="cover-detail__warn">
           日期先后有误：请核对寄出、中转与到达日期的顺序。
         </p>
-        <p v-else-if="missingDateNodes.length" class="cover-detail__warn">
+        <p v-else-if="!stale && missingDateNodes.length" class="cover-detail__warn">
           缺日警示：{{ missingDateNodes.map((n) => n.office).join('、') }} 尚未确定日期。
         </p>
-        <RouteTimeline :nodes="timeline" @select="onTimelineSelect" />
+        <div :class="{ 'cover-detail__timeline--frozen': stale }">
+          <RouteTimeline :nodes="timeline" @select="onTimelineSelect" />
+        </div>
       </section>
 
       <section class="gb-panel">
@@ -434,6 +497,24 @@ function openRoute(): void {
   border: 1px solid #ecd3a5;
   border-radius: 8px;
   padding: 6px 10px;
+}
+.cover-detail__stale {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: #b02a1e;
+  background: #fdecea;
+  border: 1px solid #e7b3ab;
+  border-radius: 8px;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.cover-detail__timeline--frozen {
+  opacity: 0.62;
+  pointer-events: none;
+  filter: grayscale(0.35);
 }
 .cover-detail__section-head {
   display: flex;

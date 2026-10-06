@@ -1,21 +1,29 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import RouteTimeline from '@/components/common/RouteTimeline.vue'
 import { buildTimeline, useCoverRoute } from '@/hooks/useCoverRoute'
 import { computeTotalDays, createRouteNode, useRouteStore } from '@/stores/routeStore'
 import { useCoverStore } from '@/stores/coverStore'
+import { useConflictStore } from '@/stores/conflictStore'
 import type { Cover } from '@/types/cover'
 import type { PostalRoute, RouteNode, TimelineNode } from '@/types/route'
 import { TRANSPORT_MODES, createEmptyRoute } from '@/types/route'
 import { toGanzhi, validateChronology } from '@/utils/dateRange'
 import { nowIso } from '@/utils/id'
+import {
+  clearRecoverableDraft,
+  loadRecoverableDraft,
+  saveRecoverableDraft
+} from '@/utils/draft'
+import { isTimelineStale } from '@/utils/timelineStatus'
 
 const props = defineProps<{ id: string }>()
 const router = useRouter()
 const routeStore = useRouteStore()
 const coverStore = useCoverStore()
+const conflictStore = useConflictStore()
 
 const routeId = computed<number | null>(() => {
   const n = Number(props.id)
@@ -59,6 +67,31 @@ const unattachedCovers = computed(() =>
   coverStore.list.filter((c) => c.routeId !== routeId.value)
 )
 
+/** 挂在本邮路、但时间轴基线已落后（节点改动后未核对）的封。 */
+const staleCovers = computed(() =>
+  attachedCovers.value.filter((c) =>
+    isTimelineStale(c, route.value, conflictStore.openConflictOfCover(c.id ?? -1) != null)
+  )
+)
+
+/** 本邮路的待裁定数：后保存一方主张挂到本路、当前尚未生效的冲突。 */
+const pendingConflicts = computed(() =>
+  routeId.value == null ? [] : conflictStore.pendingAgainstRoute(routeId.value)
+)
+
+/** 本邮路涉及的全部未裁定冲突（含先保存一方在本路的），供面板列出。 */
+const relatedConflicts = computed(() =>
+  routeId.value == null ? [] : conflictStore.openConflictsOfRoute(routeId.value)
+)
+
+function isCoverStale(cover: Cover): boolean {
+  return isTimelineStale(cover, route.value, conflictStore.openConflictOfCover(cover.id ?? -1) != null)
+}
+
+function pendingCoverIds(): Set<number> {
+  return new Set(relatedConflicts.value.map((c) => c.coverId))
+}
+
 const coverOptions = computed(() =>
   coverStore.list.flatMap((c) =>
     typeof c.id === 'number'
@@ -95,6 +128,8 @@ const fallbackTimeline = computed<TimelineNode[]>(() => {
       frontImage: '',
       backImage: '',
       note: '',
+      rev: 0,
+      timelineBaseRev: 0,
       createdAt: '',
       updatedAt: ''
     },
@@ -105,16 +140,55 @@ const fallbackTimeline = computed<TimelineNode[]>(() => {
 onMounted(async () => {
   if (!routeStore.loaded) await routeStore.load()
   if (!coverStore.loaded) await coverStore.load()
+  if (!conflictStore.loaded) await conflictStore.load()
   syncForm()
+  offerRecover()
 })
 
 watch(route, syncForm)
+
+/** 写失败后留下的可恢复草稿：重新进入邮路页时提示恢复。 */
+const RECOVER_SCOPE = computed(() => `route-header:${routeId.value ?? 'new'}`)
+const recoverHint = ref('')
+
+function offerRecover(): void {
+  const draft = loadRecoverableDraft<Partial<PostalRoute>>(RECOVER_SCOPE.value)
+  if (!draft) return
+  ElMessageBox.confirm(
+    `上次保存邮路信息失败（${draft.reason}）。是否恢复到失败前的编辑内容？`,
+    '发现可恢复草稿',
+    { confirmButtonText: '恢复草稿', cancelButtonText: '放弃', type: 'warning' }
+  )
+    .then(() => {
+      Object.assign(form, draft.value)
+      recoverHint.value = `已恢复 ${draft.savedAt.slice(0, 16)} 的失败草稿，请重新保存`
+    })
+    .catch(() => {
+      clearRecoverableDraft(RECOVER_SCOPE.value)
+    })
+}
 
 watch(attachedCovers, (list) => {
   if (selectedCoverId.value == null && list.length && typeof list[0].id === 'number') {
     selectedCoverId.value = list[0].id
   }
 })
+
+/** 保存时携带的修订基线快照：本页打开/上次同步时看到的邮路字段。 */
+const baseSnapshot = ref<Partial<PostalRoute>>({})
+
+function snapshotOf(): Partial<PostalRoute> {
+  const current = route.value
+  if (!current) return {}
+  return {
+    routeNo: current.routeNo,
+    name: current.name,
+    era: current.era,
+    transport: current.transport,
+    frequency: current.frequency,
+    remark: current.remark
+  }
+}
 
 function syncForm(): void {
   const current = route.value
@@ -123,6 +197,7 @@ function syncForm(): void {
     ...current,
     nodes: current.nodes.map((n) => ({ ...n }))
   })
+  baseSnapshot.value = snapshotOf()
 }
 
 async function saveHeader(): Promise<void> {
@@ -132,15 +207,35 @@ async function saveHeader(): Promise<void> {
     ElMessage.warning('请填写邮路名称')
     return
   }
-  await routeStore.update(id, {
+  const patch = {
     routeNo: form.routeNo,
     name: form.name,
     era: form.era,
     transport: form.transport,
     frequency: form.frequency,
     remark: form.remark
-  })
-  ElMessage.success('邮路信息已保存')
+  }
+  try {
+    const { conflictFields } = await routeStore.save(id, patch, baseSnapshot.value)
+    clearRecoverableDraft(RECOVER_SCOPE.value)
+    recoverHint.value = ''
+    if (conflictFields.length) {
+      ElMessage.warning(
+        `字段「${conflictFields.join('、')}」在另一页面已被改成不同内容，已保留先保存的值，请核对`
+      )
+    } else {
+      ElMessage.success('邮路信息已保存')
+    }
+  } catch (err) {
+    // 写库整体失败：事务已回滚，留下可恢复草稿
+    saveRecoverableDraft(RECOVER_SCOPE.value, {
+      reason: err instanceof Error ? err.message : String(err),
+      targetId: id,
+      baseRev: route.value?.rev ?? null,
+      value: patch
+    })
+    ElMessage.error('保存失败，改动已回滚并存为可恢复草稿，刷新本页可恢复重试')
+  }
 }
 
 function openNodeDialog(index: number | null): void {
@@ -156,23 +251,37 @@ async function submitNode(): Promise<void> {
     ElMessage.warning('请填写节点局所')
     return
   }
-  await routeStore.addNode(id, { ...nodeForm }, insertIndex.value ?? undefined)
-  nodeDialog.value = false
-  ElMessage.success('已加入邮路节点')
+  try {
+    await routeStore.addNode(id, { ...nodeForm }, insertIndex.value ?? undefined)
+    nodeDialog.value = false
+    ElMessage.success('已加入邮路节点，挂接封时间轴已标记失效待核对')
+  } catch (err) {
+    ElMessage.error(
+      `节点保存失败，已回滚：${err instanceof Error ? err.message : String(err)}`
+    )
+  }
 }
 
 async function onReorder(payload: { from: number; to: number }): Promise<void> {
   const id = routeId.value
   if (id == null) return
-  await routeStore.moveNode(id, payload.from, payload.to)
+  try {
+    await routeStore.moveNode(id, payload.from, payload.to)
+  } catch (err) {
+    ElMessage.error(`排序失败，已回滚：${err instanceof Error ? err.message : String(err)}`)
+  }
 }
 
 async function onRemove(index: number): Promise<void> {
   const id = routeId.value
   const node = route.value?.nodes[index]
   if (id == null || !node) return
-  await routeStore.removeNode(id, node.key)
-  ElMessage.success('已移除节点')
+  try {
+    await routeStore.removeNode(id, node.key)
+    ElMessage.success('已移除节点，挂接封时间轴已标记失效待核对')
+  } catch (err) {
+    ElMessage.error(`移除失败，已回滚：${err instanceof Error ? err.message : String(err)}`)
+  }
 }
 
 function onTimelineSelect(node: TimelineNode): void {
@@ -183,8 +292,12 @@ async function recalc(): Promise<void> {
   const id = routeId.value
   const current = route.value
   if (id == null || !current) return
-  await routeStore.update(id, { nodes: current.nodes.map((n) => ({ ...n })) })
-  ElMessage.success(`全程天数已重算：${computeTotalDays(current.nodes)} 天`)
+  try {
+    await routeStore.commitNodes(id, current.nodes.map((n) => ({ ...n })))
+    ElMessage.success(`全程天数已重算：${computeTotalDays(current.nodes)} 天`)
+  } catch (err) {
+    ElMessage.error(`重算失败，已回滚：${err instanceof Error ? err.message : String(err)}`)
+  }
 }
 
 async function attachCover(): Promise<void> {
@@ -194,19 +307,75 @@ async function attachCover(): Promise<void> {
     ElMessage.warning('请选择要挂到此邮路的实寄封')
     return
   }
-  await coverStore.update(coverId, { routeId: id })
-  ElMessage.success('实寄封已挂到该邮路')
+  const cover = coverStore.byId(coverId)
+  try {
+    const { routeConflict } = await coverStore.attachToRoute({
+      coverId,
+      routeId: id,
+      // 本页下拉里看到的原挂接：据此判断是否与另一页的先保存撞车
+      expectedFromRouteId: cover?.routeId ?? null,
+      source: 'route-page'
+    })
+    if (routeConflict) {
+      ElMessageBox.alert(
+        `该封已在另一页面被先挂到邮路 #${routeConflict.winner.routeId ?? '（摘除）'}，` +
+          `本次挂到本路的主张已列为待裁定，未覆盖先保存结果。请在下方「待裁定」面板裁决。`,
+        '挂接冲突 · 待裁定',
+        { type: 'warning' }
+      )
+    } else {
+      ElMessage.success('实寄封已挂到该邮路')
+    }
+  } catch (err) {
+    ElMessage.error(`挂接失败，已回滚：${err instanceof Error ? err.message : String(err)}`)
+  }
 }
 
 async function detachCover(cover: Cover): Promise<void> {
   if (typeof cover.id !== 'number') return
-  await coverStore.update(cover.id, { routeId: null })
-  ElMessage.success('已从邮路摘除')
+  try {
+    await coverStore.attachToRoute({
+      coverId: cover.id,
+      routeId: null,
+      expectedFromRouteId: cover.routeId,
+      source: 'route-page:detach'
+    })
+    ElMessage.success('已从邮路摘除')
+  } catch (err) {
+    ElMessage.error(`摘除失败，已回滚：${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+/** 裁决待裁定挂接：choose=winner 维持先保存，pending 改挂后保存方。 */
+async function resolveConflict(
+  conflictId: number | undefined,
+  choose: 'winner' | 'pending'
+): Promise<void> {
+  if (typeof conflictId !== 'number') return
+  try {
+    await conflictStore.resolve(conflictId, choose)
+    ElMessage.success(choose === 'pending' ? '已按后保存主张改挂，基线已重对齐' : '已维持先保存挂接')
+  } catch (err) {
+    ElMessage.error(`裁决失败：${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+/** 封详情核对后补基线（邮路页可批量确认）。 */
+async function revalidateCover(cover: Cover): Promise<void> {
+  if (typeof cover.id !== 'number') return
+  const ok = await coverStore.rebaselineTimeline(cover.id)
+  ElMessage.success(ok ? '该封时间轴已核对并补基线，恢复检索命中' : '该封时间轴本就有效')
 }
 
 function openCover(cover: Cover): void {
   if (typeof cover.id !== 'number') return
   void router.push(`/covers/${cover.id}`)
+}
+
+function routeLabelOf(routeId: number | null): string {
+  if (routeId == null) return '（摘除邮路）'
+  const rt = routeStore.byId(routeId)
+  return rt ? `${rt.routeNo} ${rt.name}` : `邮路 #${routeId}`
 }
 
 const createForm = reactive<PostalRoute>(createEmptyRoute())
@@ -228,6 +397,14 @@ async function createRoute(): Promise<void> {
     })
     ElMessage.success('邮路已创建')
     await router.replace(`/routes/${id}`)
+  } catch (err) {
+    saveRecoverableDraft('route-new', {
+      reason: err instanceof Error ? err.message : String(err),
+      targetId: null,
+      baseRev: null,
+      value: JSON.parse(JSON.stringify(createForm)) as PostalRoute
+    })
+    ElMessage.error('新建失败，已回滚并存为可恢复草稿')
   } finally {
     creating.value = false
   }
@@ -246,6 +423,24 @@ function nodeGanzhi(node: RouteNode): string {
         <h1 class="gb-page__title">
           邮路编辑器
           <span v-if="route" class="route-editor__no">{{ route.routeNo }}</span>
+          <el-tag
+            v-if="route && pendingConflicts.length"
+            type="danger"
+            effect="dark"
+            size="small"
+            class="route-editor__badge"
+          >
+            待裁定 {{ pendingConflicts.length }}
+          </el-tag>
+          <el-tag
+            v-if="route && staleCovers.length"
+            type="warning"
+            effect="dark"
+            size="small"
+            class="route-editor__badge"
+          >
+            时间轴失效 {{ staleCovers.length }}
+          </el-tag>
         </h1>
         <p class="gb-page__subtitle">
           <template v-if="route">
@@ -261,6 +456,7 @@ function nodeGanzhi(node: RouteNode): string {
     <template v-if="route">
       <section class="gb-panel">
         <h2 class="gb-panel__title">邮路信息</h2>
+        <p v-if="recoverHint" class="route-editor__recover">{{ recoverHint }}</p>
         <el-form :inline="true" label-width="82px" @submit.prevent>
           <el-form-item label="邮路号">
             <el-input v-model="form.routeNo" style="width: 130px" />
@@ -328,6 +524,53 @@ function nodeGanzhi(node: RouteNode): string {
         </el-table>
       </section>
 
+      <section v-if="relatedConflicts.length" class="gb-panel route-editor__conflicts">
+        <div class="route-editor__head">
+          <h2 class="gb-panel__title">待裁定挂接（{{ relatedConflicts.length }}）</h2>
+          <span class="route-editor__summary">
+            同一封被两个页面基于同一基线挂到不同邮路，先保存挂接保留，后保存主张在此裁决
+          </span>
+        </div>
+        <el-table :data="relatedConflicts" border stripe>
+          <el-table-column label="实寄封" min-width="150">
+            <template #default="{ row }">
+              <el-button link type="primary" @click="openCover({ id: row.coverId } as Cover)">
+                {{ row.coverNo || `#${row.coverId}` }}
+              </el-button>
+            </template>
+          </el-table-column>
+          <el-table-column label="先保存（当前生效）" min-width="180">
+            <template #default="{ row }">
+              <el-tag size="small" type="success" effect="plain">
+                挂到 {{ routeLabelOf(row.winner.routeId) }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="后保存（待裁定）" min-width="180">
+            <template #default="{ row }">
+              <el-tag size="small" type="danger" effect="plain">
+                主张挂到 {{ routeLabelOf(row.pending.routeId) }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="裁决" width="250">
+            <template #default="{ row }">
+              <el-button
+                size="small"
+                type="success"
+                :disabled="row.pending.routeId !== routeId"
+                @click="resolveConflict(row.id, 'pending')"
+              >
+                改挂后保存
+              </el-button>
+              <el-button size="small" @click="resolveConflict(row.id, 'winner')">
+                维持先保存
+              </el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </section>
+
       <section class="gb-panel">
         <h2 class="gb-panel__title">把实寄封挂到邮路节点</h2>
         <div class="route-editor__attach">
@@ -342,6 +585,7 @@ function nodeGanzhi(node: RouteNode): string {
               :key="opt.value"
               :label="opt.label"
               :value="opt.value"
+              :disabled="pendingCoverIds().has(opt.value)"
             />
           </el-select>
           <el-button type="primary" @click="attachCover">挂到此邮路</el-button>
@@ -351,6 +595,18 @@ function nodeGanzhi(node: RouteNode): string {
           <li v-for="item in attachedCovers" :key="item.id">
             <strong>{{ item.coverNo }}</strong>
             <span>{{ item.sentFrom }} → {{ item.sentTo }}</span>
+            <el-tag v-if="isCoverStale(item)" size="small" type="warning" effect="plain">
+              时间轴失效
+            </el-tag>
+            <el-button
+              v-if="isCoverStale(item) && !conflictStore.openConflictOfCover(item.id ?? -1)"
+              size="small"
+              link
+              type="warning"
+              @click="revalidateCover(item)"
+            >
+              核对补基线
+            </el-button>
             <el-button size="small" link type="primary" @click="openCover(item)">详情</el-button>
             <el-button size="small" link type="danger" @click="detachCover(item)">摘除</el-button>
           </li>
@@ -429,6 +685,21 @@ function nodeGanzhi(node: RouteNode): string {
   color: #5d3325;
   font-size: 18px;
   margin-left: 8px;
+}
+.route-editor__badge {
+  margin-left: 8px;
+}
+.route-editor__recover {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: #b02a1e;
+  background: #fdecea;
+  border: 1px solid #f0b8b2;
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+.route-editor__conflicts {
+  border-color: #e0b4ab;
 }
 .route-editor__head {
   display: flex;

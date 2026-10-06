@@ -9,19 +9,38 @@ import { useCatalogFilter } from '@/hooks/useCatalogFilter'
 import { useCoverStore } from '@/stores/coverStore'
 import { usePostmarkStore } from '@/stores/postmarkStore'
 import { useRouteStore } from '@/stores/routeStore'
+import { useConflictStore } from '@/stores/conflictStore'
 import type { ImagePayload } from '@/stores/postmarkStore'
 import type { Cover, FrankingItem } from '@/types/cover'
 import { CONDITION_GRADES, createEmptyCover } from '@/types/cover'
-import { clearDraft, loadDraft, saveDraft } from '@/utils/draft'
+import { clearDraft, loadDraft, saveDraft, saveRecoverableDraft } from '@/utils/draft'
 import { joinCn, nowIso, toNumber } from '@/utils/id'
+import { coverTimelineStartYear, isTimelineStale } from '@/utils/timelineStatus'
 
 const router = useRouter()
 const coverStore = useCoverStore()
 const postmarkStore = usePostmarkStore()
 const routeStore = useRouteStore()
+const conflictStore = useConflictStore()
 
 const source = computed(() => coverStore.list)
-const { filters, filtered, activeCount, reset } = useCatalogFilter<Cover>('cover', source)
+
+function coverSuspended(row: unknown): boolean {
+  const cover = row as Cover
+  const route = typeof cover.routeId === 'number' ? routeStore.byId(cover.routeId) : null
+  return isTimelineStale(cover, route, conflictStore.openConflictOfCover(cover.id ?? -1) != null)
+}
+function coverYear(row: unknown): number {
+  const cover = row as Cover
+  const route = typeof cover.routeId === 'number' ? routeStore.byId(cover.routeId) : null
+  return coverTimelineStartYear(cover, route).year
+}
+
+const { filters, filtered, activeCount, reset, suspendedRows } = useCatalogFilter<Cover>(
+  'cover',
+  source,
+  { isSuspended: coverSuspended, yearOfRow: coverYear }
+)
 
 const viewMode = ref<'card' | 'table'>('card')
 const dialogVisible = ref(false)
@@ -34,6 +53,7 @@ onMounted(async () => {
   if (!coverStore.loaded) await coverStore.load()
   if (!postmarkStore.loaded) await postmarkStore.load()
   if (!routeStore.loaded) await routeStore.load()
+  if (!conflictStore.loaded) await conflictStore.load()
 })
 
 watch(
@@ -131,18 +151,32 @@ async function submit(): Promise<void> {
     return
   }
   const coverNo = form.coverNo || coverStore.nextCoverNo()
-  const id = await coverStore.create(
-    {
-      ...form,
-      coverNo,
-      franking: form.franking.map((f) => ({ ...f })),
-      cancelPmIds: [...form.cancelPmIds],
-      viaPoints: [...form.viaPoints],
-      routeId: typeof form.routeId === 'number' ? form.routeId : null,
-      price: toNumber(form.price)
-    },
-    { front: frontImage.value ?? undefined, back: backImage.value ?? undefined }
-  )
+  const payload = {
+    ...form,
+    coverNo,
+    franking: form.franking.map((f) => ({ ...f })),
+    cancelPmIds: [...form.cancelPmIds],
+    viaPoints: [...form.viaPoints],
+    routeId: typeof form.routeId === 'number' ? form.routeId : null,
+    price: toNumber(form.price)
+  }
+  let id: number
+  try {
+    id = await coverStore.create(
+      payload,
+      { front: frontImage.value ?? undefined, back: backImage.value ?? undefined }
+    )
+  } catch (err) {
+    // 写入整体失败：事务回滚，留下可恢复草稿（不含图片 dataURL，避免超大）
+    saveRecoverableDraft('cover-create', {
+      reason: err instanceof Error ? err.message : String(err),
+      targetId: null,
+      baseRev: null,
+      value: { ...payload, frontImage: '', backImage: '' }
+    })
+    ElMessage.error('登记失败，数据已回滚并存为可恢复草稿')
+    return
+  }
   clearDraft('cover')
   draftHint.value = ''
   dialogVisible.value = false
@@ -223,6 +257,10 @@ function routeLabel(routeId: number | null): string {
     </section>
 
     <p v-if="!filtered.length" class="gb-empty">没有符合当前条件的实寄封，试试清空收寄地或放宽年代区间。</p>
+
+    <p v-if="suspendedRows.length" class="cover-page__paused">
+      {{ suspendedRows.length }} 封因邮路节点改动未核对或挂接待裁定，时间轴已失效、检索命中暂停。
+    </p>
 
     <div v-else-if="viewMode === 'card'" class="gb-grid gb-grid--wide">
       <CoverCard
@@ -476,6 +514,15 @@ function routeLabel(routeId: number | null): string {
   display: flex;
   gap: 10px;
   align-items: center;
+}
+.cover-page__paused {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: #b06f16;
+  background: #fdf5e6;
+  border: 1px solid #ecd3a5;
+  border-radius: 8px;
+  padding: 8px 12px;
 }
 .cover-page__franking {
   width: 100%;

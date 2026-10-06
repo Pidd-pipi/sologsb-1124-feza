@@ -41,6 +41,10 @@ export interface Cover {
   /** 封面背面图（缩略 dataURL；原图存 assets 表） */
   backImage: string
   note: string
+  /** 记录修订号（任一字段更新即自增），多标签页合并的基线 */
+  rev: number
+  /** 时间轴基线：本次时间轴所依据的邮路 nodesRev；与当前 nodesRev 不一致即失效 */
+  timelineBaseRev: number
   createdAt: string
   updatedAt: string
 }
@@ -67,6 +71,8 @@ export function createEmptyCover(): Cover {
     frontImage: '',
     backImage: '',
     note: '',
+    rev: 0,
+    timelineBaseRev: 0,
     createdAt: '',
     updatedAt: ''
   }

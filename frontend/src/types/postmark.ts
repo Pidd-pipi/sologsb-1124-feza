@@ -44,6 +44,8 @@ export interface Postmark {
   /** 戳样图（缩略 dataURL；原图存 assets 表） */
   imageDataUrl: string
   note: string
+  /** 记录修订号（任一字段更新即自增），多标签页合并的基线 */
+  rev: number
   createdAt: string
   updatedAt: string
 }
@@ -93,6 +95,7 @@ export function createEmptyPostmark(): Postmark {
     scarceLevel: '常见',
     imageDataUrl: '',
     note: '',
+    rev: 0,
     createdAt: '',
     updatedAt: ''
   }

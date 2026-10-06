@@ -8,6 +8,14 @@ import { parseEraRange, yearInRange, type EraRange } from '@/utils/dateRange'
 export type CatalogKind = 'postmark' | 'cover' | 'route'
 export type SortKey = 'recent' | 'noAsc' | 'yearAsc' | 'yearDesc'
 
+/** 行级暂停判定与统一年代推导：由调用方注入，保证检索与详情共用一套基线。 */
+export interface CatalogRowContext {
+  /** 返回 true 的行（时间轴失效 / 挂接待裁定）暂停命中，不进入检索结果 */
+  isSuspended?: (row: unknown) => boolean
+  /** 行的代表年份；不提供时走内置的字段推导 */
+  yearOfRow?: (row: unknown) => number
+}
+
 export interface CatalogFilters {
   /** 关键词：编号 / 局所 / 收寄地 / 备注 */
   keyword: string
@@ -114,16 +122,28 @@ export interface UseCatalogFilterReturn<T> {
   filters: CatalogFilters
   eraRange: ComputedRef<EraRange | null>
   filtered: ComputedRef<T[]>
+  /** 被暂停命中（时间轴失效 / 待裁定）的行 */
+  suspendedRows: ComputedRef<T[]>
   activeCount: ComputedRef<number>
   reset: () => void
 }
 
 export function useCatalogFilter<T>(
   kind: CatalogKind,
-  source: Ref<T[]> | ComputedRef<T[]>
+  source: Ref<T[]> | ComputedRef<T[]>,
+  context: CatalogRowContext = {}
 ): UseCatalogFilterReturn<T> {
   const filters = reactive<CatalogFilters>(defaultFilters())
   const eraRange = computed<EraRange | null>(() => parseEraRange(filters.era))
+
+  /** 被暂停命中的行（时间轴失效 / 待裁定），供页面提示「N 条命中已暂停」。 */
+  const suspendedRows = computed<T[]>(() => {
+    if (!context.isSuspended) return []
+    return (source.value ?? []).filter((item) => context.isSuspended!(item))
+  })
+
+  const resolveYear = (row: AnyRow): number =>
+    context.yearOfRow ? context.yearOfRow(row) : yearOf(kind, row)
 
   const filtered = computed<T[]>(() => {
     const kw = filters.keyword.trim().toLowerCase()
@@ -132,6 +152,8 @@ export function useCatalogFilter<T>(
     const rows = (source.value ?? []) as unknown as T[]
     const kept = rows.filter((item) => {
       const row = item as unknown as AnyRow
+      // 时间轴失效 / 挂接待裁定：搜索命中暂停，不参与任何筛选与排序
+      if (context.isSuspended?.(row)) return false
       if (kw && !keywordHaystack(kind, row).toLowerCase().includes(kw)) return false
       if (kind === 'postmark') {
         if (filters.type && textOf(row.type) !== filters.type) return false
@@ -149,8 +171,7 @@ export function useCatalogFilter<T>(
           const hay = `${textOf(row.sentFrom)} ${textOf(row.sentTo)}`.toLowerCase()
           if (!hay.includes(office)) return false
         }
-        const year = yearOf(kind, row)
-        if (range && !yearInRange(year, range)) return false
+        if (range && !yearInRange(resolveYear(row), range)) return false
       } else {
         if (filters.transport && textOf(row.transport) !== filters.transport) return false
         if (office) {
@@ -158,8 +179,7 @@ export function useCatalogFilter<T>(
           const hay = nodes.map((n) => textOf(n.office)).join(' ').toLowerCase()
           if (!hay.includes(office)) return false
         }
-        const year = yearOf(kind, row)
-        if (range && !yearInRange(year, range)) return false
+        if (range && !yearInRange(resolveYear(row), range)) return false
       }
       return true
     })
@@ -170,7 +190,7 @@ export function useCatalogFilter<T>(
       const rb = b as unknown as AnyRow
       if (filters.sortKey === 'noAsc') return noOf(kind, ra).localeCompare(noOf(kind, rb), 'zh-Hans-CN')
       if (filters.sortKey === 'yearAsc' || filters.sortKey === 'yearDesc') {
-        return (yearOf(kind, ra) - yearOf(kind, rb)) * direction
+        return (resolveYear(ra) - resolveYear(rb)) * direction
       }
       return textOf(rb.updatedAt).localeCompare(textOf(ra.updatedAt))
     })
@@ -187,5 +207,5 @@ export function useCatalogFilter<T>(
     Object.assign(filters, defaultFilters())
   }
 
-  return { filters, eraRange, filtered, activeCount, reset }
+  return { filters, eraRange, filtered, suspendedRows, activeCount, reset }
 }

@@ -1,15 +1,18 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useCoverStore } from '@/stores/coverStore'
 import { usePostmarkStore } from '@/stores/postmarkStore'
 import { useRouteStore } from '@/stores/routeStore'
+import { useConflictStore } from '@/stores/conflictStore'
+import { onRevision, type RevisionKind } from '@/utils/revisionBus'
 
 const current = useRoute()
 const router = useRouter()
 const postmarkStore = usePostmarkStore()
 const coverStore = useCoverStore()
 const routeStore = useRouteStore()
+const conflictStore = useConflictStore()
 
 const activeMenu = computed(() => {
   const path = current.path
@@ -35,7 +38,47 @@ const routeOptions = computed(() =>
 )
 
 onMounted(async () => {
-  await Promise.all([postmarkStore.load(), coverStore.load(), routeStore.load()])
+  await Promise.all([
+    postmarkStore.load(),
+    coverStore.load(),
+    routeStore.load(),
+    conflictStore.load()
+  ])
+})
+
+/**
+ * 修订总线：任一标签页改了节点 / 挂接 / 票戳 / 邮戳，其它标签页收到通知后
+ * 只重载受影响的 store，使封详情时间轴失效状态、综合检索暂停立即生效。
+ */
+const reloaders: Record<RevisionKind, () => Promise<void>> = {
+  route: () => routeStore.load(),
+  cover: () => coverStore.load(),
+  stampEntry: () => coverStore.load(),
+  postmark: () => postmarkStore.load(),
+  conflict: () => conflictStore.load()
+}
+
+const stopRevision = onRevision((msg) => {
+  void reloaders[msg.kind]?.()
+  // 节点结构改动 / 封与冲突变化都可能改变待裁定数与挂接列表
+  if (msg.nodesChanged || msg.kind === 'conflict') void conflictStore.load()
+})
+
+/** 标签页重新可见时兜底全量刷新，避免极端情况下错过 storage 通知。 */
+function onVisible(): void {
+  if (document.visibilityState !== 'visible') return
+  void Promise.all([
+    postmarkStore.load(),
+    coverStore.load(),
+    routeStore.load(),
+    conflictStore.load()
+  ])
+}
+
+onMounted(() => document.addEventListener('visibilitychange', onVisible))
+onUnmounted(() => {
+  stopRevision()
+  document.removeEventListener('visibilitychange', onVisible)
 })
 </script>
 
@@ -66,6 +109,15 @@ onMounted(async () => {
         </el-select>
         <span class="app-stat">
           邮戳 {{ postmarkStore.total }} · 实寄封 {{ coverStore.total }} · 邮路 {{ routeStore.total }}
+          <el-tag
+            v-if="conflictStore.openCount"
+            size="small"
+            type="danger"
+            effect="plain"
+            class="app-conflict"
+          >
+            待裁定 {{ conflictStore.openCount }}
+          </el-tag>
         </span>
       </div>
     </el-header>
@@ -133,6 +185,12 @@ onMounted(async () => {
   font-size: 12px;
   color: var(--gb-muted);
   white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.app-conflict {
+  cursor: default;
 }
 .app-main {
   padding: 0;
