@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import RouteTimeline from '@/components/common/RouteTimeline.vue'
+import RecoverBanner from '@/components/common/RecoverBanner.vue'
 import ScarceTag from '@/components/common/ScarceTag.vue'
 import StampCard from '@/components/common/StampCard.vue'
 import { useCoverRoute } from '@/hooks/useCoverRoute'
@@ -33,8 +34,19 @@ const coverId = computed<number | null>(() => {
   return Number.isFinite(n) && n > 0 ? n : null
 })
 
-const { cover, route, timeline, transitDays, missingDateNodes, chronological, error, load } =
-  useCoverRoute(coverId)
+const {
+  cover,
+  route,
+  stale,
+  hasPending,
+  pendingCandidates,
+  timeline,
+  transitDays,
+  missingDateNodes,
+  chronological,
+  error,
+  load
+} = useCoverRoute(coverId)
 
 const frontUrl = ref('')
 const backUrl = ref('')
@@ -88,17 +100,27 @@ async function replaceImage(side: 'front' | 'back', file: UploadFile): Promise<v
     reader.onload = () => resolve(String(reader.result ?? ''))
     reader.readAsDataURL(raw)
   })
-  await saveAsset({
-    ownerType: 'cover',
-    ownerId: id,
-    side,
-    dataUrl,
-    fileName: raw.name,
-    updatedAt: nowIso()
+  await safeRun('封图保存', async () => {
+    await saveAsset({
+      ownerType: 'cover',
+      ownerId: id,
+      side,
+      dataUrl,
+      fileName: raw.name,
+      updatedAt: nowIso()
+    })
+    await coverStore.update(id, side === 'front' ? { frontImage: dataUrl } : { backImage: dataUrl })
+    await loadAssetsForCover()
+    ElMessage.success(side === 'front' ? '已更新正面图' : '已更新背面图')
   })
-  await coverStore.update(id, side === 'front' ? { frontImage: dataUrl } : { backImage: dataUrl })
-  await loadAssetsForCover()
-  ElMessage.success(side === 'front' ? '已更新正面图' : '已更新背面图')
+}
+
+async function safeRun(message: string, work: () => Promise<void>): Promise<void> {
+  try {
+    await work()
+  } catch {
+    ElMessage.error(`${message}失败，已回滚；内容已存为可恢复草稿`)
+  }
 }
 
 function onFrontChange(file: UploadFile): void {
@@ -112,9 +134,11 @@ function onBackChange(file: UploadFile): void {
 async function setGrade(grade: string): Promise<void> {
   const id = coverId.value
   if (id == null) return
-  await coverStore.update(id, { conditionGrade: grade as '上品' | '中品' | '下品' })
-  await load()
-  ElMessage.success(`品相已标记为${grade}`)
+  await safeRun('品相保存', async () => {
+    await coverStore.update(id, { conditionGrade: grade as '上品' | '中品' | '下品' })
+    await load()
+    ElMessage.success(`品相已标记为${grade}`)
+  })
 }
 
 function openEntryDialog(): void {
@@ -131,15 +155,47 @@ async function submitEntry(): Promise<void> {
     ElMessage.warning('请填写邮票名称')
     return
   }
-  await coverStore.addEntry({ ...entryForm, coverId: id })
-  entryDialog.value = false
-  ElMessage.success('已加入票戳组合')
+  await safeRun('票戳组合保存', async () => {
+    await coverStore.addEntry({ ...entryForm, coverId: id })
+    entryDialog.value = false
+    ElMessage.success('已加入票戳组合')
+  })
 }
 
 async function removeEntry(entry: StamplessEntry): Promise<void> {
   if (typeof entry.id !== 'number') return
-  await coverStore.removeEntry(entry.id)
-  ElMessage.success('已移除该组合')
+  const entryId = entry.id
+  await safeRun('票戳组合删除', async () => {
+    await coverStore.removeEntry(entryId)
+    ElMessage.success('已移除该组合')
+  })
+}
+
+async function adjudicate(chosenRouteId: number): Promise<void> {
+  const id = coverId.value
+  if (id == null) return
+  await safeRun('挂接裁定', async () => {
+    await coverStore.adjudicateRoute(id, chosenRouteId)
+    ElMessage.success('已裁定，时间轴基线已对齐')
+  })
+}
+
+async function keepCurrent(): Promise<void> {
+  const id = coverId.value
+  if (id == null) return
+  await safeRun('维持原挂接', async () => {
+    await coverStore.keepCurrentRoute(id)
+    ElMessage.success('已维持原挂接并清除待裁定')
+  })
+}
+
+async function confirmTimeline(): Promise<void> {
+  const id = coverId.value
+  if (id == null) return
+  await safeRun('确认时间轴', async () => {
+    await coverStore.confirmTimeline(id)
+    ElMessage.success('已按当前节点重新确认时间轴')
+  })
 }
 
 function buildExportText(): string {
@@ -199,6 +255,14 @@ function backToList(): void {
 function openRoute(): void {
   if (route.value?.id != null) void router.push(`/routes/${route.value.id}`)
 }
+
+/** 载入上次失败的票戳组合，重新打开录入弹窗。 */
+function onRestoreEntry(attempted: unknown): void {
+  const data = attempted as StamplessEntry | null
+  if (!data || typeof data !== 'object') return
+  Object.assign(entryForm, createEmptyStampEntry(coverId.value ?? 0), data)
+  entryDialog.value = true
+}
 </script>
 
 <template>
@@ -223,6 +287,8 @@ function openRoute(): void {
       </div>
     </header>
 
+    <RecoverBanner v-if="cover" scope="stampentry" :filter-id="coverId ?? undefined" @restore="onRestoreEntry" />
+
     <p v-if="error" class="gb-empty">{{ error }}</p>
 
     <template v-else-if="cover">
@@ -240,7 +306,14 @@ function openRoute(): void {
           <div><dt>来源</dt><dd>{{ cover.acquireFrom || '未记' }}</dd></div>
           <div><dt>购入价</dt><dd>{{ cover.price }} 元</dd></div>
           <div><dt>藏册页位</dt><dd>{{ cover.storageAlbum || '未入册' }}</dd></div>
-          <div><dt>所属邮路</dt><dd>{{ route ? `${route.routeNo} ${route.name}` : '未挂邮路' }}</dd></div>
+          <div>
+            <dt>所属邮路</dt>
+            <dd>
+              {{ route ? `${route.routeNo} ${route.name}` : '未挂邮路' }}
+              <el-tag v-if="hasPending" size="small" type="danger" effect="plain">待裁定</el-tag>
+              <el-tag v-else-if="stale" size="small" type="warning" effect="plain">失效</el-tag>
+            </dd>
+          </div>
         </dl>
         <div class="cover-detail__grade">
           <span class="cover-detail__grade-label">标记品相：</span>
@@ -284,13 +357,51 @@ function openRoute(): void {
 
       <section class="gb-panel">
         <h2 class="gb-panel__title">寄递事实时间轴</h2>
-        <p v-if="!chronological" class="cover-detail__warn">
-          日期先后有误：请核对寄出、中转与到达日期的顺序。
-        </p>
-        <p v-else-if="missingDateNodes.length" class="cover-detail__warn">
-          缺日警示：{{ missingDateNodes.map((n) => n.office).join('、') }} 尚未确定日期。
-        </p>
-        <RouteTimeline :nodes="timeline" @select="onTimelineSelect" />
+        <div v-if="hasPending" class="cover-detail__stale">
+          <p class="cover-detail__stale-title">
+            该封被两处挂到不同邮路，寄递时间轴已暂停，请先裁定邮路（综合检索命中已暂停）：
+          </p>
+          <ul class="cover-detail__candidates">
+            <li v-for="cand in pendingCandidates" :key="cand.link.routeId">
+              <el-tag size="small" :type="cand.route ? 'danger' : 'info'" effect="plain">
+                {{ cand.route ? `${cand.route.routeNo} ${cand.route.name}` : `邮路 #${cand.link.routeId}（已删除）` }}
+              </el-tag>
+              <span class="cover-detail__hint">
+                {{ cand.link.source === 'route-page' ? '邮路页挂接' : '实寄封页挂接' }}
+              </span>
+              <el-button
+                size="small"
+                type="primary"
+                :disabled="!cand.route"
+                @click="adjudicate(cand.link.routeId)"
+              >
+                判给此邮路
+              </el-button>
+            </li>
+          </ul>
+          <el-button size="small" @click="keepCurrent">维持当前所属邮路</el-button>
+        </div>
+        <div v-else-if="stale" class="cover-detail__stale">
+          <p class="cover-detail__stale-title">
+            所属邮路的中转节点已改动，寄递时间轴已失效（综合检索命中已暂停）。
+            请核对后确认，或
+            <el-button v-if="route" size="small" link type="primary" @click="openRoute">
+              打开邮路编辑器
+            </el-button>
+          </p>
+          <el-button size="small" type="primary" @click="confirmTimeline">
+            节点无误，确认时间轴有效
+          </el-button>
+        </div>
+        <template v-else>
+          <p v-if="!chronological" class="cover-detail__warn">
+            日期先后有误：请核对寄出、中转与到达日期的顺序。
+          </p>
+          <p v-else-if="missingDateNodes.length" class="cover-detail__warn">
+            缺日警示：{{ missingDateNodes.map((n) => n.office).join('、') }} 尚未确定日期。
+          </p>
+          <RouteTimeline :nodes="timeline" @select="onTimelineSelect" />
+        </template>
       </section>
 
       <section class="gb-panel">
@@ -434,6 +545,34 @@ function openRoute(): void {
   border: 1px solid #ecd3a5;
   border-radius: 8px;
   padding: 6px 10px;
+}
+.cover-detail__stale {
+  border: 1px solid #e3b7b0;
+  background: #fdf1ef;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.cover-detail__stale-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: #b03a2e;
+}
+.cover-detail__candidates {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.cover-detail__candidates li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.cover-detail__hint {
+  font-size: 12px;
+  color: var(--gb-muted);
 }
 .cover-detail__section-head {
   display: flex;

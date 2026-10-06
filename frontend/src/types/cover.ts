@@ -1,5 +1,8 @@
 /** 实寄封（Cover）数据模型：一封实际寄递过的信封的全部编目事实。 */
 
+import type { PendingRouteLink } from './link'
+import { BASE_REVISION } from './route'
+
 /** 品相 */
 export type ConditionGrade = '上品' | '中品' | '下品'
 
@@ -41,6 +44,21 @@ export interface Cover {
   /** 封面背面图（缩略 dataURL；原图存 assets 表） */
   backImage: string
   note: string
+  /**
+   * 修订基线（revision）：与邮路、票戳组合按同一基线合并。
+   * 每次保存自增；创建时取 BASE_REVISION。
+   */
+  revision: number
+  /**
+   * 挂接基线：封所挂邮路在「最后一次确认一致」时的节点修订号。
+   * 小于邮路当前 nodesRevision 时，封详情的寄递时间轴立即失效。
+   */
+  linkedNodesRevision: number
+  /**
+   * 待裁定的邮路候选：同一封被两页挂到不同邮路时，
+   * 各保留一条候选；非空时时间轴失效、检索命中暂停。
+   */
+  pendingRouteLinks: PendingRouteLink[]
   createdAt: string
   updatedAt: string
 }
@@ -67,6 +85,9 @@ export function createEmptyCover(): Cover {
     frontImage: '',
     backImage: '',
     note: '',
+    revision: BASE_REVISION,
+    linkedNodesRevision: 0,
+    pendingRouteLinks: [],
     createdAt: '',
     updatedAt: ''
   }

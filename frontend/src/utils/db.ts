@@ -6,12 +6,14 @@ import Dexie, { type Table } from 'dexie'
 import type { Postmark } from '@/types/postmark'
 import type { Cover } from '@/types/cover'
 import type { PostalRoute } from '@/types/route'
+import { BASE_REVISION } from '@/types/route'
 import type { StamplessEntry } from '@/types/stampentry'
 import type { AssetOwnerType, AssetSide, CatalogAsset } from '@/types/asset'
+import { ensureCoverBaseline, ensureRouteBaseline } from '@/utils/revision'
 
 export const DB_NAME = 'gbpostmark'
 /** 当前数据结构版本号，升级迁移写在下面对应的 version() 中 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export class GbPostmarkDatabase extends Dexie {
   postmarks!: Table<Postmark, number>
@@ -34,7 +36,7 @@ export class GbPostmarkDatabase extends Dexie {
     })
 
     // v2：原图拆到 assets 表单独存放，并补齐历史记录缺省字段（升级迁移）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         postmarks:
           '++id, pmNo, type, office, province, yearFrom, yearTo, scarceLevel, inkColor, bilingual',
@@ -73,15 +75,84 @@ export class GbPostmarkDatabase extends Dexie {
             if (typeof rt.totalDays !== 'number') rt.totalDays = 0
           })
       })
+
+    // v3：邮路 / 实寄封 / 票戳组合统一补修订基线，支持按基线合并、时间轴失效与待裁定
+    this.version(DB_VERSION)
+      .stores({
+        postmarks:
+          '++id, pmNo, type, office, province, yearFrom, yearTo, scarceLevel, inkColor, bilingual',
+        covers:
+          '++id, coverNo, sentFrom, sentTo, postDate, conditionGrade, registered, routeId, acquireFrom',
+        routes: '++id, routeNo, name, era, transport, totalDays',
+        stampEntries: '++id, coverId, stampName, variety, issueYear',
+        assets: '++id, ownerType, ownerId, side, [ownerType+ownerId]'
+      })
+      .upgrade(async (tx) => {
+        // 先升级路由（补 revision，并把已带节点的历史邮路节点基线置为 1）
+        await tx
+          .table('routes')
+          .toCollection()
+          .modify((rt: Partial<PostalRoute>) => {
+            ensureRouteBaseline(rt)
+            // 历史邮路若已带节点，视为节点基线已确立（=1），升级本身不使既有时间轴失效；
+            // 升级之后再动节点才会推进 nodesRevision 并触发失效。
+            if ((rt.nodesRevision ?? 0) === 0 && Array.isArray(rt.nodes) && rt.nodes.length > 0) {
+              rt.nodesRevision = 1
+            }
+          })
+
+        // 再读一次已升级的路由，供封按所挂邮路对齐节点基线
+        const routesUpgraded = (await tx.table('routes').toCollection().toArray()) as PostalRoute[]
+        const routeMap = new Map<number, PostalRoute>(
+          routesUpgraded
+            .filter((r) => typeof r.id === 'number')
+            .map((r) => [r.id as number, r])
+        )
+        await tx
+          .table('covers')
+          .toCollection()
+          .modify((cv: Partial<Cover>) => {
+            ensureCoverBaseline(cv, (id) => routeMap.get(id) ?? null)
+          })
+        await tx
+          .table('stampEntries')
+          .toCollection()
+          .modify((se: { revision?: number }) => {
+            if (typeof se.revision !== 'number' || se.revision < 1) se.revision = BASE_REVISION
+          })
+      })
   }
 }
 
 export const db = new GbPostmarkDatabase()
 
-/** 打开数据库；首次运行写入样例数据。 */
+/** 打开数据库；首次运行写入样例数据，并对历史数据兜底补齐基线。 */
 export async function initDatabase(): Promise<void> {
   await db.open()
+  await backfillBaselines()
   await seedIfEmpty()
+}
+
+/**
+ * 版本迁移之外的兜底补基线：正常升级已由 version(3).upgrade 完成，
+ * 这里只处理迁移未覆盖到的极端情况（如开发期手工写入、旧标签页残留）。
+ */
+export async function backfillBaselines(): Promise<void> {
+  await db.routes.toCollection().modify((r: Partial<PostalRoute>) => {
+    ensureRouteBaseline(r)
+  })
+  const routesUpgraded = await db.routes.toArray()
+  const routeMap = new Map<number, PostalRoute>(
+    routesUpgraded
+      .filter((r) => typeof r.id === 'number')
+      .map((r) => [r.id as number, r])
+  )
+  await db.covers.toCollection().modify((c: Partial<Cover>) => {
+    ensureCoverBaseline(c, (id) => routeMap.get(id) ?? null)
+  })
+  await db.stampEntries.toCollection().modify((se: { revision?: number }) => {
+    if (typeof se.revision !== 'number' || se.revision < 1) se.revision = BASE_REVISION
+  })
 }
 
 /** 写入或覆盖一张原图（同 owner + side 视为同一张）。 */
@@ -313,6 +384,9 @@ function seedRoutes(): PostalRoute[] {
       totalDays: 3,
       frequency: '逐日班',
       remark: '沪宁铁路通车后邮件改由火车运送，全程三日可达。',
+      revision: BASE_REVISION,
+      nodesRevision: 1,
+      nodesChangedAt: SEED_TS,
       createdAt: SEED_TS,
       updatedAt: SEED_TS
     },
@@ -332,6 +406,9 @@ function seedRoutes(): PostalRoute[] {
       totalDays: 5,
       frequency: '隔日班',
       remark: '津浦线与沪宁线联运，邮件按班期在徐州接驳。',
+      revision: BASE_REVISION,
+      nodesRevision: 1,
+      nodesChangedAt: SEED_TS,
       createdAt: SEED_TS,
       updatedAt: SEED_TS
     },
@@ -350,6 +427,9 @@ function seedRoutes(): PostalRoute[] {
       totalDays: 8,
       frequency: '旬日班',
       remark: '长江轮船带运邮件，受水位影响班期常有延误。',
+      revision: BASE_REVISION,
+      nodesRevision: 1,
+      nodesChangedAt: SEED_TS,
       createdAt: SEED_TS,
       updatedAt: SEED_TS
     }
@@ -380,6 +460,9 @@ function seedCovers(): Cover[] {
       frontImage: coverThumbDataUrl('CV-0001', '上海', '南京', '1910-06-18'),
       backImage: '',
       note: '挂号实寄，封背有三处中转戳，戳面完整。',
+      revision: BASE_REVISION,
+      linkedNodesRevision: 1,
+      pendingRouteLinks: [],
       createdAt: SEED_TS,
       updatedAt: SEED_TS
     },
@@ -402,6 +485,9 @@ function seedCovers(): Cover[] {
       frontImage: coverThumbDataUrl('CV-0002', '天津', '上海', '1921-03-05'),
       backImage: '',
       note: '平信，封舌有裂口，票戳关系清晰。',
+      revision: BASE_REVISION,
+      linkedNodesRevision: 1,
+      pendingRouteLinks: [],
       createdAt: SEED_TS,
       updatedAt: SEED_TS
     },
@@ -427,6 +513,9 @@ function seedCovers(): Cover[] {
       frontImage: coverThumbDataUrl('CV-0003', '广州', '武汉', '1936-09-12'),
       backImage: '',
       note: '封体有水渍，邮路节点仍可辨读。',
+      revision: BASE_REVISION,
+      linkedNodesRevision: 1,
+      pendingRouteLinks: [],
       createdAt: SEED_TS,
       updatedAt: SEED_TS
     },
@@ -449,6 +538,9 @@ function seedCovers(): Cover[] {
       frontImage: coverThumbDataUrl('CV-0004', '南京', '杭州', '1958-04-02'),
       backImage: '',
       note: '到达日期待考，暂按邮路班期推定。',
+      revision: BASE_REVISION,
+      linkedNodesRevision: 0,
+      pendingRouteLinks: [],
       createdAt: SEED_TS,
       updatedAt: SEED_TS
     }
@@ -466,6 +558,7 @@ function seedStampEntries(): StamplessEntry[] {
       perforation: 'P14',
       variety: '正品',
       positionOnCover: '右上',
+      revision: BASE_REVISION,
       createdAt: SEED_TS
     },
     {
@@ -477,6 +570,7 @@ function seedStampEntries(): StamplessEntry[] {
       perforation: 'P14',
       variety: '移位',
       positionOnCover: '中部',
+      revision: BASE_REVISION,
       createdAt: SEED_TS
     },
     {
@@ -488,6 +582,7 @@ function seedStampEntries(): StamplessEntry[] {
       perforation: 'P14',
       variety: '正品',
       positionOnCover: '右上',
+      revision: BASE_REVISION,
       createdAt: SEED_TS
     },
     {
@@ -499,6 +594,7 @@ function seedStampEntries(): StamplessEntry[] {
       perforation: 'P12.5',
       variety: '组外品',
       positionOnCover: '左上',
+      revision: BASE_REVISION,
       createdAt: SEED_TS
     },
     {
@@ -510,6 +606,7 @@ function seedStampEntries(): StamplessEntry[] {
       perforation: 'P12.5',
       variety: '漏齿',
       positionOnCover: '左下',
+      revision: BASE_REVISION,
       createdAt: SEED_TS
     },
     {
@@ -521,6 +618,7 @@ function seedStampEntries(): StamplessEntry[] {
       perforation: 'P14',
       variety: '正品',
       positionOnCover: '右上',
+      revision: BASE_REVISION,
       createdAt: SEED_TS
     }
   ]

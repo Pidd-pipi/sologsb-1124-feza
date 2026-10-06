@@ -4,6 +4,8 @@ import { db } from '@/utils/db'
 import type { PostalRoute, RouteNode } from '@/types/route'
 import { daysBetween, isValidDate } from '@/utils/dateRange'
 import { nextSerialNo, nowIso, uid } from '@/utils/id'
+import { nextRevision } from '@/utils/revision'
+import { withRecover } from '@/utils/recover'
 
 /** 由节点日期计算全程天数：取首个与末个有效日期的间隔。 */
 export function computeTotalDays(nodes: RouteNode[]): number {
@@ -39,33 +41,72 @@ export const useRouteStore = defineStore('route', () => {
 
   async function create(input: PostalRoute): Promise<number> {
     const now = nowIso()
+    const hasNodes = input.nodes.length > 0
     const record: PostalRoute = {
       ...input,
       routeNo: input.routeNo || nextRouteNo(),
       nodes: input.nodes.map((n) => ({ ...n, key: n.key || uid('node') })),
       totalDays: computeTotalDays(input.nodes),
+      revision: nextRevision(input.revision),
+      nodesRevision: hasNodes ? 1 : 0,
+      nodesChangedAt: hasNodes ? now : '',
       createdAt: now,
       updatedAt: now
     }
     delete record.id
-    const id = await db.routes.add(record)
+    const snapshot = null
+    const id = await withRecover(
+      { id: null, scope: 'route', attempted: record, snapshot },
+      async () => {
+        const newId = await db.routes.add(record)
+        return newId
+      }
+    )
     await load()
     return id
   }
 
-  async function update(id: number, patch: Partial<PostalRoute>): Promise<void> {
-    const next: Partial<PostalRoute> = { ...patch, updatedAt: nowIso() }
-    if (patch.nodes) next.totalDays = computeTotalDays(patch.nodes)
-    await db.routes.update(id, next)
+  /**
+   * 保存邮路。
+   * @param nodesTouched 是否动了节点（增删 / 拖拽 / 改日期戳记）；
+   *        为 true 时推进 nodesRevision，使挂上的封时间轴立即失效。
+   */
+  async function update(
+    id: number,
+    patch: Partial<PostalRoute>,
+    opts: { nodesTouched?: boolean } = {}
+  ): Promise<void> {
+    const before = await db.routes.get(id)
+    const now = nowIso()
+    await withRecover(
+      { id, scope: 'route', attempted: { ...(before ?? {}), ...patch, id }, snapshot: before ?? null },
+      async () => {
+        if (!before) throw new Error(`邮路 ${id} 不存在，保存已回滚`)
+        const next: Partial<PostalRoute> = { ...patch, updatedAt: now }
+        if (patch.nodes) next.totalDays = computeTotalDays(patch.nodes)
+        next.revision = nextRevision(before.revision)
+        if (opts.nodesTouched) {
+          next.nodesRevision = nextRevision(before.nodesRevision)
+          next.nodesChangedAt = now
+        }
+        await db.routes.update(id, next)
+      }
+    )
     await load()
   }
 
   async function remove(id: number): Promise<void> {
-    await db.routes.delete(id)
+    const before = await db.routes.get(id)
+    await withRecover(
+      { id, scope: 'route', attempted: { deleted: true }, snapshot: before },
+      async () => {
+        await db.routes.delete(id)
+      }
+    )
     await load()
   }
 
-  /** 节点拖拽排序 */
+  /** 节点拖拽排序（动节点 → 时间轴失效） */
   async function moveNode(id: number, from: number, to: number): Promise<void> {
     const route = byId(id)
     if (!route) return
@@ -73,7 +114,7 @@ export const useRouteStore = defineStore('route', () => {
     if (from < 0 || from >= nodes.length || to < 0 || to >= nodes.length || from === to) return
     const [moved] = nodes.splice(from, 1)
     nodes.splice(to, 0, moved)
-    await update(id, { nodes })
+    await update(id, { nodes }, { nodesTouched: true })
   }
 
   /** 新增中转节点，可指定插入位置 */
@@ -82,13 +123,34 @@ export const useRouteStore = defineStore('route', () => {
     if (!route) return
     const nodes = route.nodes.map((n) => ({ ...n }))
     nodes.splice(index == null ? nodes.length : index, 0, { ...node })
-    await update(id, { nodes })
+    await update(id, { nodes }, { nodesTouched: true })
   }
 
   async function removeNode(id: number, key: string): Promise<void> {
     const route = byId(id)
     if (!route) return
-    await update(id, { nodes: route.nodes.filter((n) => n.key !== key) })
+    await update(id, { nodes: route.nodes.filter((n) => n.key !== key) }, { nodesTouched: true })
+  }
+
+  /** 仅按现有节点重算全程天数，不改动节点、不使时间轴失效。 */
+  async function recalcDays(id: number): Promise<number> {
+    const route = byId(id)
+    if (!route) return 0
+    const totalDays = computeTotalDays(route.nodes)
+    const before = await db.routes.get(id)
+    await withRecover(
+      {
+        id,
+        scope: 'route',
+        attempted: { totalDays },
+        snapshot: before ?? null
+      },
+      async () => {
+        await db.routes.update(id, { totalDays, updatedAt: nowIso() })
+      }
+    )
+    await load()
+    return totalDays
   }
 
   function byId(id: number | null | undefined): PostalRoute | null {
@@ -117,6 +179,7 @@ export const useRouteStore = defineStore('route', () => {
     moveNode,
     addNode,
     removeNode,
+    recalcDays,
     byId,
     missingDateCount
   }

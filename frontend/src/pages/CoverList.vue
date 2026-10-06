@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import CoverCard from '@/components/common/CoverCard.vue'
+import RecoverBanner from '@/components/common/RecoverBanner.vue'
 import ScarceTag from '@/components/common/ScarceTag.vue'
 import { useCatalogFilter } from '@/hooks/useCatalogFilter'
 import { useCoverStore } from '@/stores/coverStore'
@@ -66,6 +67,21 @@ function discardDraft(): void {
   frontImage.value = null
   backImage.value = null
   ElMessage.info('已清除本地草稿')
+}
+
+/** 载入上次登记失败的实寄封内容（失败恢复草稿）。 */
+function onRestoreCover(attempted: unknown): void {
+  const data = attempted as { record?: Cover } | null
+  const record = data?.record
+  if (!record) return
+  Object.assign(form, createEmptyCover(), {
+    ...record,
+    frontImage: '',
+    backImage: ''
+  })
+  frontImage.value = record.frontImage ? { dataUrl: record.frontImage, fileName: 'front' } : null
+  backImage.value = record.backImage ? { dataUrl: record.backImage, fileName: 'back' } : null
+  dialogVisible.value = true
 }
 
 function addFranking(): void {
@@ -131,23 +147,27 @@ async function submit(): Promise<void> {
     return
   }
   const coverNo = form.coverNo || coverStore.nextCoverNo()
-  const id = await coverStore.create(
-    {
-      ...form,
-      coverNo,
-      franking: form.franking.map((f) => ({ ...f })),
-      cancelPmIds: [...form.cancelPmIds],
-      viaPoints: [...form.viaPoints],
-      routeId: typeof form.routeId === 'number' ? form.routeId : null,
-      price: toNumber(form.price)
-    },
-    { front: frontImage.value ?? undefined, back: backImage.value ?? undefined }
-  )
-  clearDraft('cover')
-  draftHint.value = ''
-  dialogVisible.value = false
-  ElMessage.success(`已登记实寄封 ${coverNo}`)
-  await router.push(`/covers/${id}`)
+  try {
+    const id = await coverStore.create(
+      {
+        ...form,
+        coverNo,
+        franking: form.franking.map((f) => ({ ...f })),
+        cancelPmIds: [...form.cancelPmIds],
+        viaPoints: [...form.viaPoints],
+        routeId: typeof form.routeId === 'number' ? form.routeId : null,
+        price: toNumber(form.price)
+      },
+      { front: frontImage.value ?? undefined, back: backImage.value ?? undefined }
+    )
+    clearDraft('cover')
+    draftHint.value = ''
+    dialogVisible.value = false
+    ElMessage.success(`已登记实寄封 ${coverNo}`)
+    await router.push(`/covers/${id}`)
+  } catch {
+    ElMessage.error('实寄封保存失败，已回滚；内容已存为可恢复草稿，可稍后重试')
+  }
 }
 
 function openDetail(cover: Cover): void {
@@ -183,6 +203,8 @@ function routeLabel(routeId: number | null): string {
         <el-button type="primary" @click="openCreate">登记实寄封</el-button>
       </div>
     </header>
+
+    <RecoverBanner scope="cover" @restore="onRestoreCover" />
 
     <section class="gb-panel">
       <h2 class="gb-panel__title">筛选（{{ activeCount }} 项生效）</h2>

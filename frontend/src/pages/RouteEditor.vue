@@ -3,12 +3,13 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import RouteTimeline from '@/components/common/RouteTimeline.vue'
+import RecoverBanner from '@/components/common/RecoverBanner.vue'
 import { buildTimeline, useCoverRoute } from '@/hooks/useCoverRoute'
 import { computeTotalDays, createRouteNode, useRouteStore } from '@/stores/routeStore'
 import { useCoverStore } from '@/stores/coverStore'
 import type { Cover } from '@/types/cover'
 import type { PostalRoute, RouteNode, TimelineNode } from '@/types/route'
-import { TRANSPORT_MODES, createEmptyRoute } from '@/types/route'
+import { TRANSPORT_MODES, BASE_REVISION, createEmptyRoute } from '@/types/route'
 import { toGanzhi, validateChronology } from '@/utils/dateRange'
 import { nowIso } from '@/utils/id'
 
@@ -32,7 +33,8 @@ const selectedCoverId = ref<number | null>(null)
 
 const previewCoverId = computed<number | null>(() => selectedCoverId.value)
 
-const { cover: previewCover, timeline: previewTimeline, transitDays } = useCoverRoute(previewCoverId)
+const { cover: previewCover, timeline: previewTimeline, stale: previewStale, transitDays } =
+  useCoverRoute(previewCoverId)
 
 const nodeTimeline = computed<TimelineNode[]>(() =>
   (route.value?.nodes ?? []).map((node) => ({
@@ -54,6 +56,19 @@ const computedDays = computed(() => computeTotalDays(route.value?.nodes ?? []))
 const attachedCovers = computed(() =>
   coverStore.list.filter((c) => c.routeId === routeId.value)
 )
+
+/** 与本邮路相关、有待裁定挂接的封（现行挂此或候选含此邮路）。 */
+const pendingCovers = computed(() =>
+  routeId.value == null ? [] : coverStore.pendingCoversForRoute(routeId.value)
+)
+
+/** 因本邮路节点改动而时间轴失效的封。 */
+const staleCovers = computed(() =>
+  routeId.value == null ? [] : coverStore.staleCoversForRoute(routeId.value)
+)
+
+const pendingCount = computed(() => pendingCovers.value.length)
+const staleCount = computed(() => staleCovers.value.length)
 
 const unattachedCovers = computed(() =>
   coverStore.list.filter((c) => c.routeId !== routeId.value)
@@ -95,6 +110,9 @@ const fallbackTimeline = computed<TimelineNode[]>(() => {
       frontImage: '',
       backImage: '',
       note: '',
+      revision: BASE_REVISION,
+      linkedNodesRevision: route.value.nodesRevision ?? 0,
+      pendingRouteLinks: [],
       createdAt: '',
       updatedAt: ''
     },
@@ -132,15 +150,19 @@ async function saveHeader(): Promise<void> {
     ElMessage.warning('请填写邮路名称')
     return
   }
-  await routeStore.update(id, {
-    routeNo: form.routeNo,
-    name: form.name,
-    era: form.era,
-    transport: form.transport,
-    frequency: form.frequency,
-    remark: form.remark
-  })
-  ElMessage.success('邮路信息已保存')
+  try {
+    await routeStore.update(id, {
+      routeNo: form.routeNo,
+      name: form.name,
+      era: form.era,
+      transport: form.transport,
+      frequency: form.frequency,
+      remark: form.remark
+    })
+    ElMessage.success('邮路信息已保存')
+  } catch {
+    ElMessage.error('邮路信息保存失败，已回滚；内容已存为可恢复草稿')
+  }
 }
 
 function openNodeDialog(index: number | null): void {
@@ -156,23 +178,35 @@ async function submitNode(): Promise<void> {
     ElMessage.warning('请填写节点局所')
     return
   }
-  await routeStore.addNode(id, { ...nodeForm }, insertIndex.value ?? undefined)
-  nodeDialog.value = false
-  ElMessage.success('已加入邮路节点')
+  try {
+    await routeStore.addNode(id, { ...nodeForm }, insertIndex.value ?? undefined)
+    nodeDialog.value = false
+    ElMessage.success('已加入邮路节点；挂此邮路的封时间轴已置为失效，待重新确认')
+  } catch {
+    ElMessage.error('节点保存失败，已回滚；内容已存为可恢复草稿')
+  }
 }
 
 async function onReorder(payload: { from: number; to: number }): Promise<void> {
   const id = routeId.value
   if (id == null) return
-  await routeStore.moveNode(id, payload.from, payload.to)
+  try {
+    await routeStore.moveNode(id, payload.from, payload.to)
+  } catch {
+    ElMessage.error('节点排序保存失败，已回滚；改动已存为可恢复草稿')
+  }
 }
 
 async function onRemove(index: number): Promise<void> {
   const id = routeId.value
   const node = route.value?.nodes[index]
   if (id == null || !node) return
-  await routeStore.removeNode(id, node.key)
-  ElMessage.success('已移除节点')
+  try {
+    await routeStore.removeNode(id, node.key)
+    ElMessage.success('已移除节点；挂此邮路的封时间轴已置为失效')
+  } catch {
+    ElMessage.error('节点删除失败，已回滚；改动已存为可恢复草稿')
+  }
 }
 
 function onTimelineSelect(node: TimelineNode): void {
@@ -183,10 +217,15 @@ async function recalc(): Promise<void> {
   const id = routeId.value
   const current = route.value
   if (id == null || !current) return
-  await routeStore.update(id, { nodes: current.nodes.map((n) => ({ ...n })) })
-  ElMessage.success(`全程天数已重算：${computeTotalDays(current.nodes)} 天`)
+  try {
+    const total = await routeStore.recalcDays(id)
+    ElMessage.success(`全程天数已重算：${total} 天`)
+  } catch {
+    ElMessage.error('重算保存失败，已回滚')
+  }
 }
 
+/** 挂到本邮路：走修订基线合并。同邮路幂等；不同邮路列待裁定。 */
 async function attachCover(): Promise<void> {
   const id = routeId.value
   const coverId = selectedCoverId.value
@@ -194,14 +233,58 @@ async function attachCover(): Promise<void> {
     ElMessage.warning('请选择要挂到此邮路的实寄封')
     return
   }
-  await coverStore.update(coverId, { routeId: id })
-  ElMessage.success('实寄封已挂到该邮路')
+  try {
+    const result = await coverStore.attachRoute(coverId, id, 'route-page')
+    if (result.conflict) {
+      ElMessage.warning('该封在另一处已挂不同邮路，已列为待裁定，未覆盖原挂接')
+    } else if (!result.changed) {
+      ElMessage.info('该封已挂在此邮路，无需重复保存')
+    } else {
+      ElMessage.success('实寄封已挂到该邮路')
+    }
+  } catch {
+    ElMessage.error('挂接保存失败，已回滚；改动已存为可恢复草稿')
+  }
 }
 
 async function detachCover(cover: Cover): Promise<void> {
   if (typeof cover.id !== 'number') return
-  await coverStore.update(cover.id, { routeId: null })
-  ElMessage.success('已从邮路摘除')
+  try {
+    await coverStore.attachRoute(cover.id, null, 'route-page')
+    ElMessage.success('已从邮路摘除')
+  } catch {
+    ElMessage.error('摘除失败，已回滚；改动已存为可恢复草稿')
+  }
+}
+
+async function adjudicate(cover: Cover, chosenRouteId: number): Promise<void> {
+  if (typeof cover.id !== 'number') return
+  try {
+    await coverStore.adjudicateRoute(cover.id, chosenRouteId)
+    ElMessage.success('已按所选邮路裁定，挂接基线已对齐')
+  } catch {
+    ElMessage.error('裁定保存失败，已回滚')
+  }
+}
+
+async function dismissPending(cover: Cover): Promise<void> {
+  if (typeof cover.id !== 'number') return
+  try {
+    await coverStore.keepCurrentRoute(cover.id)
+    ElMessage.success('已维持原挂接并清除待裁定标记')
+  } catch {
+    ElMessage.error('操作失败，已回滚')
+  }
+}
+
+async function confirmTimeline(cover: Cover): Promise<void> {
+  if (typeof cover.id !== 'number') return
+  try {
+    await coverStore.confirmTimeline(cover.id)
+    ElMessage.success('已按当前节点重新确认时间轴')
+  } catch {
+    ElMessage.error('确认失败，已回滚')
+  }
 }
 
 function openCover(cover: Cover): void {
@@ -228,6 +311,8 @@ async function createRoute(): Promise<void> {
     })
     ElMessage.success('邮路已创建')
     await router.replace(`/routes/${id}`)
+  } catch {
+    ElMessage.error('邮路创建失败，已回滚；内容已存为可恢复草稿')
   } finally {
     creating.value = false
   }
@@ -236,6 +321,27 @@ async function createRoute(): Promise<void> {
 function nodeGanzhi(node: RouteNode): string {
   const year = Number((node.arriveDate || '').slice(0, 4))
   return year ? toGanzhi(year) : '—'
+}
+
+/** 载入上次失败的邮路提交：无 id 载入新建表单，有 id 载入信息表单。 */
+function onRestoreRoute(attempted: unknown): void {
+  const data = attempted as Partial<PostalRoute> | null
+  if (!data || typeof data !== 'object') return
+  const target = createEmptyRoute()
+  Object.assign(target, {
+    routeNo: data.routeNo ?? '',
+    name: data.name ?? '',
+    era: data.era ?? '',
+    transport: data.transport ?? '铁路',
+    frequency: data.frequency ?? '',
+    remark: data.remark ?? '',
+    nodes: Array.isArray(data.nodes) ? data.nodes.map((n) => ({ ...n })) : []
+  })
+  if (typeof data.id === 'number' && data.id === routeId.value) {
+    Object.assign(form, target)
+  } else {
+    Object.assign(createForm, target)
+  }
 }
 </script>
 
@@ -254,9 +360,19 @@ function nodeGanzhi(node: RouteNode): string {
           </template>
           <template v-else>节点可拖拽排序、增删中转地，全程天数按节点日期自动计算。</template>
         </p>
+        <div v-if="route" class="route-editor__badges">
+          <el-tag :type="pendingCount ? 'danger' : 'success'" effect="plain" size="small">
+            待裁定 {{ pendingCount }}
+          </el-tag>
+          <el-tag :type="staleCount ? 'warning' : 'success'" effect="plain" size="small">
+            时间轴失效 {{ staleCount }}
+          </el-tag>
+        </div>
       </div>
       <el-button @click="router.push('/covers')">返回实寄封目录</el-button>
     </header>
+
+    <RecoverBanner scope="route" @restore="onRestoreRoute" />
 
     <template v-if="route">
       <section class="gb-panel">
@@ -329,7 +445,15 @@ function nodeGanzhi(node: RouteNode): string {
       </section>
 
       <section class="gb-panel">
-        <h2 class="gb-panel__title">把实寄封挂到邮路节点</h2>
+        <h2 class="gb-panel__title">
+          把实寄封挂到邮路节点
+          <el-tag size="small" type="danger" effect="plain" class="route-editor__count">
+            待裁定 {{ pendingCount }}
+          </el-tag>
+          <el-tag size="small" type="warning" effect="plain" class="route-editor__count">
+            失效 {{ staleCount }}
+          </el-tag>
+        </h2>
         <div class="route-editor__attach">
           <el-select
             v-model="selectedCoverId"
@@ -346,15 +470,82 @@ function nodeGanzhi(node: RouteNode): string {
           </el-select>
           <el-button type="primary" @click="attachCover">挂到此邮路</el-button>
         </div>
-        <p v-if="!attachedCovers.length" class="gb-empty">该邮路尚未挂任何实寄封。</p>
-        <ul v-else class="route-editor__covers">
+
+        <div v-if="pendingCovers.length" class="route-editor__pending">
+          <p class="route-editor__pending-title">
+            待裁定挂接（{{ pendingCovers.length }}）：同一封被两处挂到不同邮路，请人工选定
+          </p>
+          <ul class="route-editor__pending-list">
+            <li v-for="item in pendingCovers" :key="`pend-${item.id}`">
+              <div class="route-editor__pending-main">
+                <strong>{{ item.coverNo }}</strong>
+                <span>{{ item.sentFrom }} → {{ item.sentTo }}</span>
+                <span class="route-editor__pending-routes">
+                  候选：
+                  <template v-for="(cand, ci) in item.pendingRouteLinks" :key="cand.routeId">
+                    <el-tag
+                      size="small"
+                      :type="cand.routeId === routeId ? 'danger' : 'info'"
+                      effect="plain"
+                    >
+                      {{ routeStore.byId(cand.routeId)?.routeNo ?? `#${cand.routeId}` }}
+                      {{ routeStore.byId(cand.routeId)?.name ?? '（已删除）' }}
+                    </el-tag>
+                    <span v-if="ci < item.pendingRouteLinks.length - 1"> / </span>
+                  </template>
+                </span>
+              </div>
+              <div class="route-editor__pending-actions">
+                <el-button size="small" type="primary" @click="adjudicate(item, routeId!)">
+                  判给本邮路
+                </el-button>
+                <el-button
+                  v-if="item.routeId !== routeId"
+                  size="small"
+                  @click="adjudicate(item, item.routeId!)"
+                >
+                  维持原邮路
+                </el-button>
+                <el-button size="small" link @click="dismissPending(item)">忽略分歧</el-button>
+                <el-button size="small" link type="primary" @click="openCover(item)">详情</el-button>
+              </div>
+            </li>
+          </ul>
+        </div>
+
+        <p v-if="!attachedCovers.length && !pendingCovers.length" class="gb-empty">
+          该邮路尚未挂任何实寄封。
+        </p>
+        <ul v-if="attachedCovers.length" class="route-editor__covers">
           <li v-for="item in attachedCovers" :key="item.id">
             <strong>{{ item.coverNo }}</strong>
             <span>{{ item.sentFrom }} → {{ item.sentTo }}</span>
+            <el-tag v-if="coverStore.isStale(item)" size="small" type="warning" effect="plain">
+              时间轴失效
+            </el-tag>
             <el-button size="small" link type="primary" @click="openCover(item)">详情</el-button>
             <el-button size="small" link type="danger" @click="detachCover(item)">摘除</el-button>
           </li>
         </ul>
+
+        <div v-if="staleCovers.length" class="route-editor__stale">
+          <p class="route-editor__pending-title">
+            节点改动后，以下 {{ staleCovers.length }} 封的寄递时间轴已失效（综合检索命中已暂停）
+          </p>
+          <ul class="route-editor__covers">
+            <li v-for="item in staleCovers" :key="`stale-${item.id}`">
+              <strong>{{ item.coverNo }}</strong>
+              <span>{{ item.sentFrom }} → {{ item.sentTo }}</span>
+              <span class="route-editor__hint">
+                基线 {{ item.linkedNodesRevision ?? 0 }} / 节点 {{ route?.nodesRevision ?? 0 }}
+              </span>
+              <el-button size="small" type="primary" @click="confirmTimeline(item)">
+                确认时间轴有效
+              </el-button>
+            </li>
+          </ul>
+        </div>
+
         <p v-if="unattachedCovers.length" class="route-editor__hint">
           另有 {{ unattachedCovers.length }} 封未挂邮路，可在上方下拉中检索。
         </p>
@@ -362,12 +553,15 @@ function nodeGanzhi(node: RouteNode): string {
 
       <section class="gb-panel">
         <h2 class="gb-panel__title">按实寄封预览寄递时间轴</h2>
-        <p v-if="previewCover" class="route-editor__hint">
+        <p v-if="previewCover && previewStale" class="route-editor__warn">
+          该封时间轴已失效（节点已改动或挂接待裁定），请先在上方确认或裁定后再看时间轴。
+        </p>
+        <p v-else-if="previewCover" class="route-editor__hint">
           预览：{{ previewCover.coverNo }} · 在途
           {{ transitDays == null ? '待考' : `${transitDays} 天` }}
         </p>
         <RouteTimeline
-          :nodes="previewCover ? previewTimeline : fallbackTimeline"
+          :nodes="previewCover && previewStale ? [] : previewCover ? previewTimeline : fallbackTimeline"
           title="寄递事实时间轴"
         />
       </section>
@@ -487,5 +681,67 @@ function nodeGanzhi(node: RouteNode): string {
   margin: 6px 0 0;
   font-size: 12px;
   color: var(--gb-muted);
+}
+.route-editor__badges {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.route-editor__count {
+  margin-left: 8px;
+}
+.route-editor__pending,
+.route-editor__stale {
+  margin: 8px 0 12px;
+  padding: 8px 10px;
+  border: 1px solid #ecd3a5;
+  background: #fdf5e6;
+  border-radius: 8px;
+}
+.route-editor__pending-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: #b06f16;
+}
+.route-editor__pending-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.route-editor__pending-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: #fff;
+  border: 1px solid var(--gb-line);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+.route-editor__pending-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--gb-muted);
+}
+.route-editor__pending-main strong {
+  color: #5d3325;
+}
+.route-editor__pending-routes {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.route-editor__pending-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 </style>

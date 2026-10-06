@@ -25,7 +25,14 @@ const era = ref('')
 const groups = reactive({ postmark: true, cover: true, route: true })
 
 const pmFilter = useCatalogFilter<Postmark>('postmark', computed(() => postmarkStore.list))
-const coverFilter = useCatalogFilter<Cover>('cover', computed(() => coverStore.list))
+/** 时间轴失效 / 挂接待裁定的封暂停参与综合检索，直到重新确认或裁定。 */
+const searchableCovers = computed<Cover[]>(() =>
+  coverStore.list.filter((c) => !coverStore.isSearchSuspended(c))
+)
+const suspendedCoverCount = computed(
+  () => coverStore.list.length - searchableCovers.value.length
+)
+const coverFilter = useCatalogFilter<Cover>('cover', searchableCovers)
 const routeFilter = useCatalogFilter<PostalRoute>('route', computed(() => routeStore.list))
 
 const eraHint = computed(() => {
@@ -86,6 +93,9 @@ function resetAll(): void {
         <h1 class="gb-page__title">综合检索</h1>
         <p class="gb-page__subtitle">
           跨邮戳、实寄封、邮路按关键词与年代检索，结果按类型分组；命中 {{ totalHits }} 条。
+        </p>
+        <p v-if="suspendedCoverCount" class="search-view__suspended">
+          {{ suspendedCoverCount }} 封实寄封因邮路节点改动或挂接待裁定，命中已暂停，确认 / 裁定后自动恢复。
         </p>
       </div>
       <el-button @click="resetAll">重置全部条件</el-button>
@@ -247,6 +257,11 @@ function resetAll(): void {
   margin: 6px 0 0;
   font-size: 12px;
   color: var(--gb-muted);
+}
+.search-view__suspended {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: #b03a2e;
 }
 .search-view__pm img {
   max-width: 100%;

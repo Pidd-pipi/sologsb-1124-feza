@@ -26,6 +26,8 @@ export interface StamplessEntry {
   perforation: string
   variety: VarietyType
   positionOnCover: CoverPosition
+  /** 修订基线（revision）：与邮路、实寄封按同一基线合并，每次保存自增。 */
+  revision: number
   createdAt: string
 }
 
@@ -50,6 +52,7 @@ export function createEmptyStampEntry(coverId: number): StamplessEntry {
     perforation: 'P11',
     variety: '正品',
     positionOnCover: '右上',
+    revision: 1,
     createdAt: ''
   }
 }

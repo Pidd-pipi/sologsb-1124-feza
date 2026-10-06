@@ -38,11 +38,23 @@ export interface PostalRoute {
   /** 班期，如「逐日班」「隔日班」 */
   frequency: string
   remark: string
+  /**
+   * 修订基线（revision）：邮路与封、票戳组合按同一基线合并。
+   * 每次保存自增；节点改动会让挂在该邮路上的封时间轴立即失效。
+   */
+  revision: number
+  /** 节点修订号：仅节点增删 / 拖拽 / 改日期 / 改戳记时自增 */
+  nodesRevision: number
+  /** 节点最近一次改动时间（ISO），用于判定时间轴是否失效 */
+  nodesChangedAt: string
   createdAt: string
   updatedAt: string
 }
 
 export const TRANSPORT_MODES: TransportMode[] = ['步班', '船运', '铁路', '航空']
+
+/** 基线初值：历史数据升级后统一补到该基线。 */
+export const BASE_REVISION = 1
 
 /** 生成一条空白邮路记录，供表单初始化使用。 */
 export function createEmptyRoute(): PostalRoute {
@@ -55,6 +67,9 @@ export function createEmptyRoute(): PostalRoute {
     totalDays: 0,
     frequency: '',
     remark: '',
+    revision: BASE_REVISION,
+    nodesRevision: 0,
+    nodesChangedAt: '',
     createdAt: '',
     updatedAt: ''
   }

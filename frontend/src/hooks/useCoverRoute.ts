@@ -1,12 +1,18 @@
 /**
  * 由实寄封与邮路节点拼出寄递时间轴，并计算在途天数。
  * 被封详情页与邮路编辑器复用。
+ *
+ * 数据取自 cover / route 两个 store（响应式）：邮路节点一旦改动，
+ * 依赖该邮路的封的时间轴立即判为失效，无需重新拉取。
  */
 import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
-import { db } from '@/utils/db'
 import type { Cover } from '@/types/cover'
 import type { PostalRoute, TimelineNode } from '@/types/route'
+import type { PendingRouteLink } from '@/types/link'
 import { daysBetween, isValidDate } from '@/utils/dateRange'
+import { isTimelineStale } from '@/utils/revision'
+import { useCoverStore } from '@/stores/coverStore'
+import { useRouteStore } from '@/stores/routeStore'
 
 /** 由封与邮路拼时间轴：寄出 → 中转（邮路节点 / 中转地） → 到达。 */
 export function buildTimeline(cover: Cover | null, route: PostalRoute | null): TimelineNode[] {
@@ -68,31 +74,25 @@ export function buildTimeline(cover: Cover | null, route: PostalRoute | null): T
   return nodes
 }
 
+export interface PendingCandidate {
+  link: PendingRouteLink
+  route: PostalRoute | null
+}
+
 export function useCoverRoute(coverId: Ref<number | null> | ComputedRef<number | null>) {
-  const cover = ref<Cover | null>(null)
-  const route = ref<PostalRoute | null>(null)
+  const coverStore = useCoverStore()
+  const routeStore = useRouteStore()
+
   const loading = ref(false)
   const error = ref('')
 
   async function load(): Promise<void> {
-    const id = coverId.value
-    if (id == null || Number.isNaN(id)) {
-      cover.value = null
-      route.value = null
-      error.value = id == null ? '' : '封号无效'
-      return
-    }
     loading.value = true
     try {
-      const found = await db.covers.get(id)
-      cover.value = found ?? null
-      error.value = found ? '' : `未找到编号为 ${id} 的实寄封`
-      if (found && typeof found.routeId === 'number') {
-        const rt = await db.routes.get(found.routeId)
-        route.value = rt ?? null
-      } else {
-        route.value = null
-      }
+      if (!coverStore.loaded) await coverStore.load()
+      if (!routeStore.loaded) await routeStore.load()
+      const id = coverId.value
+      error.value = id == null ? '' : coverStore.byId(id) ? '' : `未找到编号为 ${id} 的实寄封`
     } finally {
       loading.value = false
     }
@@ -100,7 +100,24 @@ export function useCoverRoute(coverId: Ref<number | null> | ComputedRef<number |
 
   watch(coverId, () => void load(), { immediate: true })
 
-  const timeline = computed<TimelineNode[]>(() => buildTimeline(cover.value, route.value))
+  const cover = computed<Cover | null>(() => coverStore.byId(coverId.value))
+  const route = computed<PostalRoute | null>(() =>
+    cover.value ? routeStore.byId(cover.value.routeId) : null
+  )
+
+  /** 节点改动 / 待裁定 → 时间轴立即失效。 */
+  const stale = computed<boolean>(() => isTimelineStale(cover.value, route.value))
+  const hasPending = computed<boolean>(() => (cover.value?.pendingRouteLinks?.length ?? 0) > 0)
+
+  /** 待裁定候选（带上邮路信息供页面渲染）。 */
+  const pendingCandidates = computed<PendingCandidate[]>(() => {
+    const links = cover.value?.pendingRouteLinks ?? []
+    return links.map((link) => ({ link, route: routeStore.byId(link.routeId) }))
+  })
+
+  const timeline = computed<TimelineNode[]>(() =>
+    stale.value ? [] : buildTimeline(cover.value, route.value)
+  )
 
   /** 在途天数：寄出日期 → 到达日期 */
   const transitDays = computed<number | null>(() => {
@@ -122,5 +139,18 @@ export function useCoverRoute(coverId: Ref<number | null> | ComputedRef<number |
     return true
   })
 
-  return { cover, route, timeline, transitDays, missingDateNodes, chronological, loading, error, load }
+  return {
+    cover,
+    route,
+    stale,
+    hasPending,
+    pendingCandidates,
+    timeline,
+    transitDays,
+    missingDateNodes,
+    chronological,
+    loading,
+    error,
+    load
+  }
 }
